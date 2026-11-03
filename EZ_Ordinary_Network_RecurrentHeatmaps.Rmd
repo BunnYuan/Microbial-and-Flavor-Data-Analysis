@@ -1,0 +1,2636 @@
+---
+title: "EZ Microbial Co-occurrence Network: CLR-Spearman"
+output:
+  github_document:
+    toc: true
+    toc_depth: 2
+---
+
+This workflow retains the CLR-Spearman analysis, including network topology,
+stage-response connection densities, and paginated recurrent-association heatmaps.
+Set `INPUT_DIR` and verify input filenames before rendering.
+
+## Initialization
+
+```{r section-0, echo=TRUE, message=TRUE, warning=TRUE}
+############################################################
+# EZ ordinary microbial co-occurrence network analysis
+# CLR-Spearman analysis
+#
+# Revision based on EZ_Network_Topology_NoExtraPackage.R
+#
+# Main revision:
+# - Convert the former bacteria-fungi bipartite network into an
+#   ordinary undirected weighted network.
+# - Test all unique ASV pairs across the combined bacterial + fungal
+#   feature table, including:
+#       1) Bacteria-Bacteria
+#       2) Fungi-Fungi
+#       3) Bacteria-Fungi
+# - Apply BH-FDR once across all unique pairwise tests in the network.
+# - Retain the original sample matching, prevalence filtering,
+#   CLR transformation,
+#   Spearman correlation, thresholds, and Park x Season recurrence
+#   workflow.
+# - Export CLR-Spearman results into the original CLR output folder.
+# - Summarize four stage-response edge classes and their connection densities.
+# - Colour EZ-depleted nodes red, EZ-enriched nodes blue, and non-response
+#   nodes grey.
+# - Export recurrent-association heatmaps in pages of a fixed maximum
+#   number of associations, plus a separate top-30 heatmap.
+#   Retain the original page size and export resolution.
+# - Record matched sample counts and brewing-cycle coverage for each
+#   Park x Season context, without requiring both cycles in every context.
+# - Retain the original MIN_GROUP_N = 5 rule for context-level rho and
+#   directional-repeatability assessment; smaller groups remain missing.
+#
+# No additional R packages are introduced.
+############################################################
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+```
+
+## User Settings
+
+```{r section-1, echo=TRUE, message=TRUE, warning=TRUE}
+############################
+## 0. USER SETTINGS
+############################
+
+# Set INPUT_DIR to the directory containing the input files.
+INPUT_DIR <- "."
+OUTPUT_ROOT <- file.path(INPUT_DIR, "075EZ_Bacteria_Fungi_Network_Results_Final4")
+
+# Invalidate any previous success marker before dependency checks or analysis.
+completion_marker <- file.path(OUTPUT_ROOT, "ANALYSIS_COMPLETED_SUCCESSFULLY.txt")
+if (file.exists(completion_marker)) {
+  if (!file.remove(completion_marker)) {
+    stop("Cannot remove the previous completion marker: ", completion_marker)
+  }
+}
+
+# CLR-Spearman output folder (original folder name retained).
+CLR_DIR <- file.path(OUTPUT_ROOT, "01_CLR_Spearman_primary")
+
+# Remove previous generated method outputs before a new run, preventing
+# outdated heatmaps/tables from remaining when the new run has no result.
+RESET_METHOD_OUTPUT_DIRS <- TRUE
+
+METADATA_FILE <- file.path(INPUT_DIR, "sample_metadata.xlsx")
+BACTERIAL_FILE <- file.path(INPUT_DIR, "16sASV_table.tsv")
+FUNGAL_FILE <- file.path(INPUT_DIR, "ITS_ASV_table.tsv")
+STAGE_RESPONSE_FILE <- file.path(INPUT_DIR, "Stage_response_ASVs.xlsx")
+# Rename the bacterial taxonomy input to the English filename below,
+# or edit this setting to match the actual filename.
+BACTERIAL_TAX_FILE <- file.path(INPUT_DIR, "16sTaxonomy_ASV.tsv")
+FUNGAL_TAX_FILE <- file.path(INPUT_DIR, "ITS_Taxonomy_ASV.tsv")
+
+EZ_LABEL <- "EZ"
+PARK_LEVELS <- c("70", "30", "5")
+SEASON_LEVELS <- c("Spring", "Summer", "Autumn", "Winter")
+
+# Keep the original pre-specified network settings.
+MIN_PREVALENCE <- 0.20
+MIN_OVERALL_N <- 30
+MIN_GROUP_N <- 5               # Minimum n for group-wise rho and repeatability assessment
+RHO_THRESHOLD <- 0.7
+FDR_THRESHOLD <- 0.05
+
+# Network figure settings.
+NETWORK_LAYOUT_METHOD <- "fr"  # "fr" or "kk"
+MAX_NODE_LABELS <- 20
+NETWORK_PLOT_WIDTH <- 16
+NETWORK_PLOT_HEIGHT <- 13
+
+# Split all recurrent associations across multiple heatmaps rather than
+# reducing image resolution or compressing the plot.
+HEATMAP_MAX_ASSOCIATIONS_PER_PAGE <- 80L
+HEATMAP_PNG_DPI <- 300
+RANDOM_SEED <- 20261031
+
+# CLR zero handling: fixed additive pseudocount on raw ASV counts.
+CLR_PSEUDOCOUNT <- 1
+```
+
+## Packages
+
+```{r section-2, echo=TRUE, message=TRUE, warning=TRUE}
+############################
+## 1. PACKAGES
+############################
+
+# The package set is unchanged from the original script.
+required_packages <- c(
+  "ggplot2", "dplyr", "tidyr", "igraph", "ggrepel", "readxl"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(igraph)
+  library(ggrepel)
+  library(readxl)
+})
+
+set.seed(RANDOM_SEED)
+
+dir.create(OUTPUT_ROOT, showWarnings = FALSE, recursive = TRUE)
+
+if (RESET_METHOD_OUTPUT_DIRS) {
+  for (method_output_dir in c(CLR_DIR)) {
+    if (dir.exists(method_output_dir)) {
+      unlink(method_output_dir, recursive = TRUE, force = TRUE)
+    }
+  }
+}
+
+dir.create(CLR_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Input And Transformation Functions
+
+```{r section-3, echo=TRUE, message=TRUE, warning=TRUE}
+############################
+## 2. INPUT AND TRANSFORMATION FUNCTIONS
+############################
+
+read_input_table <- function(file, object_name = "input table") {
+  if (length(file) != 1 || is.na(file) || !file.exists(file)) {
+    stop(object_name, " file not found: ", paste(file, collapse = ", "))
+  }
+
+  ext <- tolower(tools::file_ext(file))
+
+  if (ext %in% c("xlsx", "xls")) {
+    dat <- as.data.frame(
+      readxl::read_excel(file, .name_repair = "minimal"),
+      check.names = FALSE
+    )
+  } else if (ext == "csv") {
+    dat <- read.csv(
+      file, check.names = FALSE, stringsAsFactors = FALSE,
+      fileEncoding = "UTF-8-BOM"
+    )
+  } else if (ext %in% c("tsv", "txt", "tab")) {
+    dat <- read.delim(
+      file, sep = "\t", header = TRUE, check.names = FALSE,
+      stringsAsFactors = FALSE, quote = "", comment.char = "",
+      fileEncoding = "UTF-8-BOM"
+    )
+  } else {
+    stop("Unsupported file format for ", object_name, ": .", ext)
+  }
+
+  dat <- as.data.frame(dat, check.names = FALSE)
+  names(dat) <- trimws(sub("^\\ufeff", "", names(dat)))
+
+  if (ncol(dat) == 0) {
+    stop("No columns read from ", object_name, ".")
+  }
+
+  dat
+}
+
+
+read_asv_count_table <- function(file) {
+  dat <- read_input_table(file, "ASV count table")
+
+  if (ncol(dat) < 3) {
+    stop("ASV table must contain ASV_ID and at least two sample columns: ", file)
+  }
+
+  asv_id <- trimws(as.character(dat[[1]]))
+
+  if (anyNA(asv_id) || any(asv_id == "") || anyDuplicated(asv_id)) {
+    stop("ASV_ID is missing or duplicated in: ", file)
+  }
+
+  numeric_data <- lapply(dat[-1], function(x) suppressWarnings(as.numeric(x)))
+  mat <- as.matrix(as.data.frame(numeric_data, check.names = FALSE))
+
+  if (anyNA(mat) || any(!is.finite(mat)) || any(mat < 0)) {
+    stop(
+      "ASV count table contains non-numeric, missing, infinite or negative values: ",
+      file
+    )
+  }
+
+  rownames(mat) <- asv_id
+  mat
+}
+
+
+read_metadata_table <- function(file) {
+  dat <- read_input_table(file, "metadata")
+
+  if (!"Stage" %in% names(dat) && "SampleType" %in% names(dat)) {
+    dat <- dplyr::rename(dat, Stage = SampleType)
+  } else if ("Stage" %in% names(dat) && "SampleType" %in% names(dat)) {
+    if (!identical(
+      trimws(as.character(dat$Stage)),
+      trimws(as.character(dat$SampleType))
+    )) {
+      stop("Stage and SampleType columns are both present but differ.")
+    }
+  }
+
+  dat
+}
+
+
+read_taxonomy <- function(file) {
+  if (length(file) != 1 || is.na(file) || !file.exists(file)) {
+    return(data.frame(ASV_ID = character(), Genus = character()))
+  }
+
+  tx <- read_input_table(file, "taxonomy table")
+  nm <- tolower(trimws(names(tx)))
+
+  id_idx <- match(c("asv_id", "asvid", "asv", "feature_id", "otu_id"), nm)
+  id_idx <- id_idx[!is.na(id_idx)][1]
+
+  genus_idx <- match(c("genus", "genus_name", "genusname"), nm)
+  genus_idx <- genus_idx[!is.na(genus_idx)][1]
+
+  if (is.na(id_idx) || is.na(genus_idx)) {
+    nm2 <- tolower(gsub("[^[:alnum:]]", "", names(tx)))
+
+    if (is.na(id_idx)) {
+      tmp <- match(c("asvid", "asv", "featureid", "otuid"), nm2)
+      id_idx <- tmp[!is.na(tmp)][1]
+    }
+
+    if (is.na(genus_idx)) {
+      tmp <- match(c("genus", "genusname"), nm2)
+      genus_idx <- tmp[!is.na(tmp)][1]
+    }
+  }
+
+  if (is.na(id_idx) || is.na(genus_idx)) {
+    stop(
+      "Cannot identify ASV_ID and Genus columns in taxonomy file: ", file,
+      "\nObserved columns: ", paste(names(tx), collapse = ", ")
+    )
+  }
+
+  genus <- trimws(as.character(tx[[genus_idx]]))
+  genus <- sub("^g\\s*__\\s*", "", genus, ignore.case = TRUE)
+  genus <- trimws(genus)
+
+  unknown <- is.na(genus) | genus == "" |
+    tolower(genus) %in% c(
+      "unidentified", "unclassified", "uncultured", "unknown",
+      "norank", "unassigned", "na", "n/a", "none", "-"
+    )
+
+  genus[unknown] <- "Unclassified"
+
+  data.frame(
+    ASV_ID = trimws(as.character(tx[[id_idx]])),
+    Genus = genus,
+    stringsAsFactors = FALSE
+  ) %>%
+    filter(!is.na(ASV_ID), ASV_ID != "") %>%
+    distinct(ASV_ID, .keep_all = TRUE)
+}
+
+
+normalize_domain <- function(x) {
+  z <- tolower(trimws(as.character(x)))
+  out <- rep(NA_character_, length(z))
+
+  out[z %in% c("b", "bacteria", "bacterial")] <- "Bacteria"
+  out[z %in% c("f", "fungi", "fungal", "fungus")] <- "Fungi"
+
+  out
+}
+
+
+read_stage_response <- function(file) {
+  x <- read_input_table(file, "Stage-response ASV table")
+  required <- c("Domain", "ASV_ID", "Response")
+
+  if (!all(required %in% names(x))) {
+    stop(
+      "Stage-response file must contain: ",
+      paste(required, collapse = ", ")
+    )
+  }
+
+  if (!"Four_season_consistent" %in% names(x)) {
+    x$Four_season_consistent <- NA_character_
+  }
+
+  x <- x %>%
+    transmute(
+      Domain = normalize_domain(Domain),
+      ASV_ID_input = trimws(as.character(ASV_ID)),
+      Response_raw = tolower(trimws(as.character(Response))),
+      Four_season_raw = tolower(trimws(as.character(Four_season_consistent)))
+    )
+
+  if (anyNA(x$Domain) || anyNA(x$ASV_ID_input) || any(x$ASV_ID_input == "")) {
+    stop("Invalid Domain or ASV_ID in Stage-response file.")
+  }
+
+  x <- x %>%
+    mutate(
+      ASV_ID = case_when(
+        Domain == "Bacteria" ~ sub("^B_", "", ASV_ID_input, ignore.case = TRUE),
+        Domain == "Fungi" ~ sub("^F_", "", ASV_ID_input, ignore.case = TRUE),
+        TRUE ~ ASV_ID_input
+      ),
+      Response = case_when(
+        grepl("enrich", Response_raw) ~ "EZ_enriched",
+        grepl("deplet", Response_raw) ~ "EZ_depleted",
+        TRUE ~ NA_character_
+      ),
+      Four_season_consistent = case_when(
+        grepl(
+          "not[_ -]?consistent|inconsistent|false|^no$|^n$|^0$",
+          Four_season_raw
+        ) ~ "No",
+        grepl("yes|true|consistent|4.?season", Four_season_raw) ~ "Yes",
+        TRUE ~ "Not_available"
+      )
+    )
+
+  if (anyNA(x$Response)) {
+    stop("Response values must indicate EZ-enriched or EZ-depleted ASVs.")
+  }
+
+  if (anyDuplicated(paste(x$Domain, x$ASV_ID, sep = "|"))) {
+    stop("Duplicated Domain-ASV_ID combinations after prefix normalization.")
+  }
+
+  x %>%
+    select(Domain, ASV_ID_input, ASV_ID, Response, Four_season_consistent)
+}
+
+
+clr_from_counts_pseudocount <- function(
+    counts_taxa_by_sample,
+    pseudocount = CLR_PSEUDOCOUNT) {
+
+  # Input: ASVs in rows, samples in columns.
+  # Output: samples in rows, ASVs in columns.
+  count_matrix <- t(as.matrix(counts_taxa_by_sample))
+  storage.mode(count_matrix) <- "numeric"
+
+  if (any(!is.finite(count_matrix)) || any(count_matrix < 0)) {
+    stop("Count matrix contains non-finite or negative values.")
+  }
+
+  if (any(rowSums(count_matrix) <= 0)) {
+    stop(
+      "At least one sample has zero reads among prevalence-filtered ASVs; ",
+      "CLR cannot be calculated."
+    )
+  }
+
+  if (length(pseudocount) != 1 ||
+      !is.finite(pseudocount) ||
+      pseudocount <= 0) {
+    stop("CLR_PSEUDOCOUNT must be one positive finite number.")
+  }
+
+  # Add the fixed pseudocount to each retained ASV count, then calculate CLR.
+  # CLR(x) = log(x) - mean(log(x)) for the ASVs in that sample.
+  log_x <- log(count_matrix + pseudocount)
+  clr_matrix <- sweep(log_x, 1, rowMeans(log_x), FUN = "-")
+  dimnames(clr_matrix) <- dimnames(count_matrix)
+
+  clr_matrix
+}
+
+
+spearman_p_matrix <- function(rho_mat, n) {
+  p_mat <- matrix(
+    NA_real_,
+    nrow = nrow(rho_mat),
+    ncol = ncol(rho_mat),
+    dimnames = dimnames(rho_mat)
+  )
+
+  if (n <= 2) {
+    return(p_mat)
+  }
+
+  ok <- is.finite(rho_mat)
+  r <- pmin(pmax(rho_mat[ok], -0.999999999), 0.999999999)
+  t_stat <- abs(r) * sqrt((n - 2) / (1 - r^2))
+  p_mat[ok] <- 2 * stats::pt(-t_stat, df = n - 2)
+
+  p_mat
+}
+
+
+# Convert a symmetric correlation matrix to one record per unique,
+# undirected node pair. BH correction is applied to these unique tests only.
+matrix_to_undirected_pairs <- function(rho_mat, p_mat) {
+  if (!identical(dim(rho_mat), dim(p_mat))) {
+    stop("rho_mat and p_mat dimensions do not match.")
+  }
+
+  idx <- which(
+    upper.tri(rho_mat, diag = FALSE) & is.finite(rho_mat),
+    arr.ind = TRUE
+  )
+
+  if (nrow(idx) == 0) {
+    return(data.frame(
+      Node1 = character(),
+      Node2 = character(),
+      Domain1 = character(),
+      Domain2 = character(),
+      ASV1 = character(),
+      ASV2 = character(),
+      EdgeID = character(),
+      rho = numeric(),
+      P_value = numeric(),
+      FDR = numeric(),
+      Edge_type = character(),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  node1 <- rownames(rho_mat)[idx[, 1]]
+  node2 <- colnames(rho_mat)[idx[, 2]]
+  rho_value <- as.numeric(rho_mat[idx])
+  p_value <- as.numeric(p_mat[idx])
+
+  domain1 <- sub("\\|.*$", "", node1)
+  domain2 <- sub("\\|.*$", "", node2)
+  asv1 <- sub("^(Bacteria|Fungi)\\|", "", node1)
+  asv2 <- sub("^(Bacteria|Fungi)\\|", "", node2)
+
+  edge_type <- dplyr::case_when(
+    domain1 == "Bacteria" & domain2 == "Bacteria" ~ "Bacteria-Bacteria",
+    domain1 == "Fungi" & domain2 == "Fungi" ~ "Fungi-Fungi",
+    TRUE ~ "Bacteria-Fungi"
+  )
+
+  out <- data.frame(
+    Node1 = node1,
+    Node2 = node2,
+    Domain1 = domain1,
+    Domain2 = domain2,
+    ASV1 = asv1,
+    ASV2 = asv2,
+    EdgeID = paste(node1, node2, sep = "||"),
+    rho = rho_value,
+    P_value = p_value,
+    stringsAsFactors = FALSE
+  )
+
+  # One global BH correction across all unique bacterial-bacterial,
+  # fungal-fungal and bacterial-fungal tests.
+  out$FDR <- stats::p.adjust(out$P_value, method = "BH")
+  out$Edge_type <- edge_type
+
+  out %>%
+    select(
+      Node1, Node2, Domain1, Domain2, ASV1, ASV2,
+      EdgeID, Edge_type, rho, P_value, FDR
+    )
+}
+
+
+safe_spearman <- function(x, y, min_n = MIN_GROUP_N) {
+  ok <- is.finite(x) & is.finite(y)
+  x <- x[ok]
+  y <- y[ok]
+  n <- length(x)
+
+  if (n < min_n || length(unique(x)) < 2 || length(unique(y)) < 2) {
+    return(list(rho = NA_real_, n = n))
+  }
+
+  list(
+    rho = as.numeric(stats::cor(x, y, method = "spearman")),
+    n = n
+  )
+}
+
+
+save_plot_all_formats <- function(
+    plot, file_stem, width, height, dpi = 300) {
+
+  ggplot2::ggsave(
+    paste0(file_stem, ".png"), plot,
+    width = width, height = height, dpi = dpi,
+    limitsize = FALSE
+  )
+
+  ggplot2::ggsave(
+    paste0(file_stem, ".pdf"), plot,
+    width = width, height = height,
+    limitsize = FALSE
+  )
+
+  ggplot2::ggsave(
+    paste0(file_stem, ".svg"), plot,
+    device = grDevices::svg,
+    width = width, height = height,
+    limitsize = FALSE
+  )
+}
+
+
+make_combined_matrix <- function(bac_mat, fun_mat) {
+  if (!identical(rownames(bac_mat), rownames(fun_mat))) {
+    stop("Bacterial and fungal matrices do not have identical sample order.")
+  }
+
+  bac_use <- as.matrix(bac_mat)
+  fun_use <- as.matrix(fun_mat)
+
+  colnames(bac_use) <- paste0("Bacteria|", colnames(bac_use))
+  colnames(fun_use) <- paste0("Fungi|", colnames(fun_use))
+
+  combined <- cbind(bac_use, fun_use)
+  storage.mode(combined) <- "numeric"
+
+  if (anyDuplicated(colnames(combined))) {
+    stop("Duplicated node IDs in the combined matrix.")
+  }
+
+  combined
+}
+
+
+make_node_information <- function(
+    bac_ids, fun_ids, bac_tax, fun_tax, stage_response) {
+
+  nodes <- bind_rows(
+    data.frame(ASV_ID = bac_ids, Domain = "Bacteria"),
+    data.frame(ASV_ID = fun_ids, Domain = "Fungi")
+  ) %>%
+    mutate(node_id = paste0(Domain, "|", ASV_ID)) %>%
+    left_join(
+      bind_rows(
+        bac_tax %>% mutate(Domain = "Bacteria"),
+        fun_tax %>% mutate(Domain = "Fungi")
+      ),
+      by = c("Domain", "ASV_ID")
+    ) %>%
+    mutate(
+      Genus = ifelse(
+        is.na(Genus) | Genus == "",
+        "Unclassified",
+        Genus
+      ),
+      Response = "No_stage_response",
+      Four_season_consistent = "Not_available"
+    ) %>%
+    left_join(
+      stage_response %>%
+        select(Domain, ASV_ID, Response, Four_season_consistent),
+      by = c("Domain", "ASV_ID"),
+      suffix = c("", ".stage")
+    ) %>%
+    mutate(
+      Response = ifelse(
+        !is.na(Response.stage),
+        Response.stage,
+        Response
+      ),
+      Four_season_consistent = ifelse(
+        !is.na(Four_season_consistent.stage),
+        Four_season_consistent.stage,
+        Four_season_consistent
+      ),
+      label = ifelse(
+        Genus == "Unclassified",
+        ASV_ID,
+        paste0(
+          Genus, "_",
+          sub("^.*?(\\d+)$", "\\1", ASV_ID, perl = TRUE)
+        )
+      ),
+      # Stage-response category is shown by node fill colour only.
+      # Four-season consistency is retained in output tables but not displayed.
+      label_plot = label
+    ) %>%
+    select(-Response.stage, -Four_season_consistent.stage)
+
+  nodes
+}
+
+
+annotate_network_edges <- function(edge_table, node_info) {
+  node_annotation_1 <- node_info %>%
+    transmute(
+      Node1 = node_id,
+      Genus1 = Genus,
+      Response1 = Response,
+      FourSeason1 = Four_season_consistent
+    )
+
+  node_annotation_2 <- node_info %>%
+    transmute(
+      Node2 = node_id,
+      Genus2 = Genus,
+      Response2 = Response,
+      FourSeason2 = Four_season_consistent
+    )
+
+  edge_table %>%
+    left_join(node_annotation_1, by = "Node1") %>%
+    left_join(node_annotation_2, by = "Node2") %>%
+    mutate(
+      Genus1 = ifelse(is.na(Genus1), "Unclassified", Genus1),
+      Genus2 = ifelse(is.na(Genus2), "Unclassified", Genus2),
+      Direction = ifelse(rho > 0, "Positive", "Negative"),
+      EdgeLabel = paste0(
+        Genus1, " (", ASV1, ") — ",
+        Genus2, " (", ASV2, ")"
+      )
+    )
+}
+
+
+# Classify retained network edges by the stage-response categories of their
+# two endpoints and calculate category-specific connection densities.
+# Denominators use ALL prevalence-filtered ASVs in node_info, including
+# isolated nodes, rather than only nodes that happen to enter the network.
+summarize_stage_response_edges <- function(edge_table, node_info) {
+
+  response_levels <- c(
+    "EZ_enriched",
+    "EZ_depleted",
+    "No_stage_response"
+  )
+
+  node_counts <- table(
+    factor(node_info$Response, levels = response_levels)
+  )
+
+  n_enriched <- as.integer(node_counts["EZ_enriched"])
+  n_depleted <- as.integer(node_counts["EZ_depleted"])
+  n_no_response <- as.integer(node_counts["No_stage_response"])
+  n_stage_response <- n_enriched + n_depleted
+
+  edge_out <- edge_table
+
+  if (nrow(edge_out) > 0) {
+    edge_out <- edge_out %>%
+      mutate(
+        Stage_response_edge_category = case_when(
+          Response1 == "EZ_enriched" &
+            Response2 == "EZ_enriched" ~ "Enriched-Enriched",
+
+          Response1 == "EZ_depleted" &
+            Response2 == "EZ_depleted" ~ "Depleted-Depleted",
+
+          (Response1 == "EZ_enriched" &
+             Response2 == "EZ_depleted") |
+            (Response1 == "EZ_depleted" &
+               Response2 == "EZ_enriched") ~ "Enriched-Depleted",
+
+          (Response1 %in% c("EZ_enriched", "EZ_depleted") &
+             Response2 == "No_stage_response") |
+            (Response2 %in% c("EZ_enriched", "EZ_depleted") &
+               Response1 == "No_stage_response") ~
+            "Stage response-No response",
+
+          Response1 == "No_stage_response" &
+            Response2 == "No_stage_response" ~
+            "No response-No response",
+
+          TRUE ~ "Unclassified"
+        )
+      )
+  } else {
+    edge_out$Stage_response_edge_category <- character(0)
+  }
+
+  category_definitions <- data.frame(
+    Category = c(
+      "Enriched-Enriched",
+      "Depleted-Depleted",
+      "Enriched-Depleted",
+      "Stage response-No response"
+    ),
+    Group1 = c(
+      "EZ_enriched",
+      "EZ_depleted",
+      "EZ_enriched",
+      "EZ_enriched + EZ_depleted"
+    ),
+    Group2 = c(
+      "EZ_enriched",
+      "EZ_depleted",
+      "EZ_depleted",
+      "No_stage_response"
+    ),
+    N_nodes_group1 = c(
+      n_enriched,
+      n_depleted,
+      n_enriched,
+      n_stage_response
+    ),
+    N_nodes_group2 = c(
+      n_enriched,
+      n_depleted,
+      n_depleted,
+      n_no_response
+    ),
+    Possible_edges = c(
+      choose(n_enriched, 2),
+      choose(n_depleted, 2),
+      n_enriched * n_depleted,
+      n_stage_response * n_no_response
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  observed_counts <- if (nrow(edge_out) > 0) {
+    table(
+      factor(
+        edge_out$Stage_response_edge_category,
+        levels = category_definitions$Category
+      )
+    )
+  } else {
+    setNames(integer(nrow(category_definitions)), category_definitions$Category)
+  }
+
+  category_summary <- category_definitions %>%
+    mutate(
+      Observed_edges = as.integer(observed_counts[Category]),
+      Connection_density = ifelse(
+        Possible_edges > 0,
+        Observed_edges / Possible_edges,
+        NA_real_
+      ),
+      Total_network_edges = nrow(edge_out)
+    ) %>%
+    select(
+      Category, Group1, Group2,
+      N_nodes_group1, N_nodes_group2,
+      Observed_edges, Possible_edges,
+      Connection_density, Total_network_edges
+    )
+
+  audit_summary <- data.frame(
+    Total_network_edges = nrow(edge_out),
+    Edges_in_four_requested_categories = sum(
+      edge_out$Stage_response_edge_category %in%
+        category_definitions$Category
+    ),
+    No_response_No_response_edges = sum(
+      edge_out$Stage_response_edge_category == "No response-No response",
+      na.rm = TRUE
+    ),
+    Other_unclassified_edges = sum(
+      edge_out$Stage_response_edge_category == "Unclassified",
+      na.rm = TRUE
+    ),
+    N_EZ_enriched_nodes = n_enriched,
+    N_EZ_depleted_nodes = n_depleted,
+    N_No_stage_response_nodes = n_no_response,
+    stringsAsFactors = FALSE
+  )
+
+  list(
+    edges = edge_out,
+    summary = category_summary,
+    audit = audit_summary
+  )
+}
+```
+
+## Network Topology Functions
+
+```{r section-4, echo=TRUE, message=TRUE, warning=TRUE}
+############################
+## 3. NETWORK TOPOLOGY FUNCTIONS
+############################
+
+calculate_network_topology <- function(g) {
+  if (igraph::vcount(g) == 0 || igraph::ecount(g) == 0) {
+    stop("Network topology metrics require at least one node and one edge.")
+  }
+
+  # Preserve signed rho in the edge table.
+  # Use |rho| as non-negative association strength for weighted topology.
+  edge_weight <- abs(igraph::E(g)$rho)
+  edge_distance <- 1 / pmax(edge_weight, 1e-8)
+
+  igraph::E(g)$weight <- edge_weight
+  igraph::E(g)$distance <- edge_distance
+
+  # Node-level basic metrics.
+  degree_value <- igraph::degree(g, mode = "all", loops = FALSE)
+
+  strength_value <- igraph::strength(
+    g,
+    mode = "all",
+    loops = FALSE,
+    weights = igraph::E(g)$weight
+  )
+
+  # Weighted shortest paths: stronger associations have shorter distances.
+  betweenness_value <- igraph::betweenness(
+    g,
+    directed = FALSE,
+    weights = igraph::E(g)$distance,
+    normalized = TRUE
+  )
+
+  closeness_value <- igraph::closeness(
+    g,
+    mode = "all",
+    weights = igraph::E(g)$distance,
+    normalized = TRUE
+  )
+  closeness_value[!is.finite(closeness_value)] <- NA_real_
+
+  # Harmonic centrality accommodates disconnected graphs.
+  distance_matrix <- igraph::distances(
+    g,
+    v = igraph::V(g),
+    to = igraph::V(g),
+    weights = igraph::E(g)$distance
+  )
+
+  inverse_distance <- 1 / distance_matrix
+  inverse_distance[!is.finite(inverse_distance)] <- 0
+  diag(inverse_distance) <- 0
+  harmonic_value <- rowSums(inverse_distance)
+
+  # Eigenvector centrality is calculated and scaled within each
+  # connected component. Values are comparable within, not across,
+  # different connected components.
+  component_result <- igraph::components(g)
+  eigenvector_value <- rep(NA_real_, igraph::vcount(g))
+
+  for (component_id in sort(unique(component_result$membership))) {
+    vertex_indices <- which(component_result$membership == component_id)
+    subgraph <- igraph::induced_subgraph(g, vids = vertex_indices)
+
+    eigen_result <- tryCatch(
+      igraph::eigen_centrality(
+        subgraph,
+        directed = FALSE,
+        weights = igraph::E(subgraph)$weight,
+        scale = TRUE
+      )$vector,
+      error = function(e) rep(NA_real_, length(vertex_indices))
+    )
+
+    eigen_result <- as.numeric(eigen_result)
+
+    if (length(eigen_result) != length(vertex_indices)) {
+      eigen_result <- rep(NA_real_, length(vertex_indices))
+    }
+
+    max_eigen <- suppressWarnings(max(eigen_result, na.rm = TRUE))
+
+    if (is.finite(max_eigen) && max_eigen > 0) {
+      eigen_result <- eigen_result / max_eigen
+    } else {
+      eigen_result[] <- NA_real_
+    }
+
+    eigenvector_value[vertex_indices] <- eigen_result
+  }
+
+  # Weighted Louvain community detection and modularity.
+  # Positive and negative edges both contribute by |rho|;
+  # association direction remains separately available in edge tables.
+  set.seed(RANDOM_SEED)
+
+  community_result <- igraph::cluster_louvain(
+    g,
+    weights = igraph::E(g)$weight,
+    resolution = 1
+  )
+
+  community_membership <- igraph::membership(community_result)
+
+  community_size_lookup <- table(community_membership)
+  community_size_value <- as.integer(
+    community_size_lookup[as.character(community_membership)]
+  )
+
+  weighted_modularity <- as.numeric(
+    igraph::modularity(
+      g,
+      membership = community_membership,
+      weights = igraph::E(g)$weight,
+      resolution = 1,
+      directed = FALSE
+    )
+  )
+
+  node_metrics <- data.frame(
+    node_id = igraph::V(g)$name,
+    Degree = as.numeric(degree_value),
+    Strength = as.numeric(strength_value),
+    Betweenness = as.numeric(betweenness_value),
+    Closeness = as.numeric(closeness_value),
+    Harmonic_centrality = as.numeric(harmonic_value),
+    Eigenvector_centrality_componentwise = as.numeric(eigenvector_value),
+    Component_ID = as.integer(component_result$membership),
+    Component_size = as.integer(
+      component_result$csize[component_result$membership]
+    ),
+    Community_ID = as.integer(community_membership),
+    Community_size = community_size_value,
+    stringsAsFactors = FALSE
+  )
+
+  edge_betweenness_value <- igraph::edge_betweenness(
+    g,
+    directed = FALSE,
+    weights = igraph::E(g)$distance
+  )
+
+  edge_metrics <- data.frame(
+    EdgeID = as.character(igraph::E(g)$EdgeID),
+    Weight = as.numeric(edge_weight),
+    Distance = as.numeric(edge_distance),
+    Edge_betweenness = as.numeric(edge_betweenness_value),
+    stringsAsFactors = FALSE
+  )
+
+  # Community-level composition.
+  community_ids <- sort(unique(community_membership))
+
+  community_summary <- do.call(rbind, lapply(community_ids, function(cid) {
+    vertex_indices <- which(community_membership == cid)
+    subgraph <- igraph::induced_subgraph(g, vids = vertex_indices)
+    vertex_domains <- as.character(igraph::V(subgraph)$Domain)
+
+    data.frame(
+      Community_ID = as.integer(cid),
+      N_nodes = igraph::vcount(subgraph),
+      N_bacterial_nodes = sum(vertex_domains == "Bacteria", na.rm = TRUE),
+      N_fungal_nodes = sum(vertex_domains == "Fungi", na.rm = TRUE),
+      N_internal_edges = igraph::ecount(subgraph),
+      Total_internal_abs_rho_weight = sum(igraph::E(subgraph)$weight),
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  # Connected-component composition.
+  component_ids <- sort(unique(component_result$membership))
+
+  component_summary <- do.call(rbind, lapply(component_ids, function(cid) {
+    vertex_indices <- which(component_result$membership == cid)
+    subgraph <- igraph::induced_subgraph(g, vids = vertex_indices)
+    vertex_domains <- as.character(igraph::V(subgraph)$Domain)
+
+    data.frame(
+      Component_ID = as.integer(cid),
+      N_nodes = igraph::vcount(subgraph),
+      N_bacterial_nodes = sum(vertex_domains == "Bacteria", na.rm = TRUE),
+      N_fungal_nodes = sum(vertex_domains == "Fungi", na.rm = TRUE),
+      N_edges = igraph::ecount(subgraph),
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  n_nodes <- igraph::vcount(g)
+  n_possible_edges <- choose(n_nodes, 2)
+  network_density <- if (n_possible_edges > 0) {
+    igraph::ecount(g) / n_possible_edges
+  } else {
+    NA_real_
+  }
+
+  global_transitivity <- tryCatch(
+    igraph::transitivity(g, type = "global", isolates = "zero"),
+    error = function(e) NA_real_
+  )
+
+  average_local_transitivity <- tryCatch(
+    igraph::transitivity(g, type = "average", isolates = "zero"),
+    error = function(e) NA_real_
+  )
+
+  domain_codes <- ifelse(
+    as.character(igraph::V(g)$Domain) == "Bacteria",
+    1L,
+    2L
+  )
+
+  domain_assortativity <- if (length(unique(domain_codes)) >= 2) {
+    tryCatch(
+      igraph::assortativity_nominal(
+        g,
+        types = domain_codes,
+        directed = FALSE
+      ),
+      error = function(e) NA_real_
+    )
+  } else {
+    NA_real_
+  }
+
+  topology_summary <- data.frame(
+    Network_density = as.numeric(network_density),
+    Global_transitivity = as.numeric(global_transitivity),
+    Average_local_transitivity = as.numeric(average_local_transitivity),
+    Domain_assortativity_nominal = as.numeric(domain_assortativity),
+    Mean_degree = mean(degree_value),
+    Maximum_degree = max(degree_value),
+    Mean_strength = mean(strength_value),
+    Maximum_strength = max(strength_value),
+    Mean_betweenness = mean(betweenness_value, na.rm = TRUE),
+    Maximum_betweenness = max(betweenness_value, na.rm = TRUE),
+    Mean_closeness = mean(closeness_value, na.rm = TRUE),
+    Maximum_closeness = max(closeness_value, na.rm = TRUE),
+    Mean_harmonic_centrality = mean(harmonic_value),
+    Mean_eigenvector_centrality_componentwise =
+      mean(eigenvector_value, na.rm = TRUE),
+    N_communities = length(unique(community_membership)),
+    Weighted_modularity_Louvain_abs_rho = weighted_modularity,
+    Mean_edge_betweenness = mean(edge_betweenness_value),
+    Maximum_edge_betweenness = max(edge_betweenness_value),
+    stringsAsFactors = FALSE
+  )
+
+  list(
+    nodes = node_metrics,
+    edges = edge_metrics,
+    community_summary = community_summary,
+    component_summary = component_summary,
+    summary = topology_summary
+  )
+}
+
+
+write_network_metric_definitions <- function(out_dir) {
+  definitions <- data.frame(
+    Metric = c(
+      "Degree",
+      "Strength",
+      "Weight",
+      "Distance",
+      "Betweenness",
+      "Closeness",
+      "Harmonic_centrality",
+      "Eigenvector_centrality_componentwise",
+      "Edge_betweenness",
+      "Network_density",
+      "Global_transitivity",
+      "Average_local_transitivity",
+      "Domain_assortativity_nominal",
+      "Weighted_modularity_Louvain_abs_rho",
+      "Community_ID",
+      "Component_ID"
+    ),
+    Definition = c(
+      "Number of incident edges connected to a node.",
+      "Sum of absolute Spearman correlation coefficients of edges incident to a node.",
+      "Absolute Spearman correlation coefficient for an edge: |rho|.",
+      "Inverse absolute correlation: 1/|rho|; used as path length for weighted shortest-path metrics.",
+      "Normalized node betweenness based on shortest paths using distance = 1/|rho|.",
+      "Normalized closeness based on weighted shortest paths; calculated within the node's reachable component.",
+      "Sum of reciprocal finite shortest-path distances; accommodates disconnected components.",
+      "Eigenvector centrality calculated separately and scaled to a maximum of 1 within each connected component.",
+      "Edge betweenness based on shortest paths using distance = 1/|rho|.",
+      "Observed edges divided by all possible undirected edges among network nodes.",
+      "Global clustering coefficient (transitivity) of the undirected network.",
+      "Mean local clustering coefficient across network nodes.",
+      "Nominal assortativity by domain; positive values indicate a tendency for same-domain connections.",
+      "Standard undirected weighted Louvain modularity using |rho|.",
+      "Louvain community assignment for each node.",
+      "Connected-component assignment for each node."
+    ),
+    Interpretation_note = c(
+      "Unweighted node connectivity.",
+      "Weighted node connectivity; larger values indicate stronger total absolute association.",
+      "Retains association strength but not sign; sign remains in rho/Direction.",
+      "Stronger associations are treated as shorter distances.",
+      "High values indicate nodes that lie on many weighted shortest paths.",
+      "For disconnected graphs, conventional closeness is based on reachable nodes only; interpret with Component_ID.",
+      "Useful complementary measure for disconnected networks.",
+      "Values are comparable within a component, not across different components.",
+      "High values indicate edges that bridge many weighted shortest paths.",
+      "Calculated on nodes participating in at least one retained network edge.",
+      "Higher values indicate stronger global triangular closure.",
+      "Higher values indicate greater local clustering on average.",
+      "This is a descriptive network assortativity statistic, not a significance test.",
+      "Use as exploratory community structure; positive and negative edges are both weighted by |rho|.",
+      "Nodes sharing an ID belong to the same detected community.",
+      "Nodes sharing an ID are connected by at least one path."
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  write.csv(
+    definitions,
+    file.path(out_dir, "network_metric_definitions.csv"),
+    row.names = FALSE
+  )
+}
+```
+
+## Read And Match Samples
+
+```{r section-5, echo=TRUE, message=TRUE, warning=TRUE}
+############################
+## 4. READ AND MATCH SAMPLES
+############################
+
+metadata <- read_metadata_table(METADATA_FILE)
+
+# Brewing-cycle/year information is optional for the network calculation,
+# but is recorded to document whether a Park x Season context is represented
+# by one or both production cycles.
+cycle_candidates <- c("BrewingCycle", "Cycle", "ProductionCycle", "Year")
+cycle_col_matches <- cycle_candidates[cycle_candidates %in% names(metadata)]
+
+if (length(cycle_col_matches) > 0) {
+  cycle_source_column <- cycle_col_matches[1]
+  metadata$BrewingCycle_for_reporting <- trimws(
+    as.character(metadata[[cycle_source_column]])
+  )
+  metadata$BrewingCycle_for_reporting[
+    is.na(metadata$BrewingCycle_for_reporting) |
+      metadata$BrewingCycle_for_reporting == ""
+  ] <- "Unknown"
+} else {
+  cycle_source_column <- NA_character_
+  metadata$BrewingCycle_for_reporting <- "Not_recorded"
+}
+
+required_meta <- c("SampleID", "Park", "Season")
+
+if (!"Stage" %in% names(metadata)) {
+  stop("Metadata must contain Stage or SampleType (BZ/EZ/PM).")
+}
+
+if (!all(required_meta %in% names(metadata))) {
+  stop("Metadata must contain: ", paste(required_meta, collapse = ", "))
+}
+
+metadata <- metadata %>%
+  mutate(
+    SampleID = trimws(as.character(SampleID)),
+    Stage = trimws(as.character(Stage)),
+    Park = trimws(as.character(Park)),
+    Season = trimws(as.character(Season))
+  )
+
+if (anyDuplicated(metadata$SampleID)) {
+  stop("Duplicated SampleID in metadata.")
+}
+
+metadata_ez_all <- metadata %>% filter(Stage == EZ_LABEL)
+
+if (nrow(metadata_ez_all) == 0) {
+  stop("No EZ samples found in metadata.")
+}
+
+bac_counts_all <- read_asv_count_table(BACTERIAL_FILE)
+fun_counts_all <- read_asv_count_table(FUNGAL_FILE)
+
+missing_bac <- setdiff(metadata_ez_all$SampleID, colnames(bac_counts_all))
+missing_fun <- setdiff(metadata_ez_all$SampleID, colnames(fun_counts_all))
+
+zero_depth_bac <- intersect(
+  colnames(bac_counts_all)[colSums(bac_counts_all) == 0],
+  metadata_ez_all$SampleID
+)
+
+zero_depth_fun <- intersect(
+  colnames(fun_counts_all)[colSums(fun_counts_all) == 0],
+  metadata_ez_all$SampleID
+)
+
+valid_bac <- setdiff(colnames(bac_counts_all), zero_depth_bac)
+valid_fun <- setdiff(colnames(fun_counts_all), zero_depth_fun)
+
+# Keep each EZ sample when both its bacterial and fungal libraries are
+# available. There is NO requirement that every Park x Season context contain
+# samples from both brewing cycles; available matched samples from one cycle
+# remain eligible for the overall network and context-level correlations.
+common_samples <- metadata_ez_all$SampleID[
+  metadata_ez_all$SampleID %in% valid_bac &
+    metadata_ez_all$SampleID %in% valid_fun
+]
+
+if (length(common_samples) < MIN_OVERALL_N) {
+  stop(
+    "Only ", length(common_samples),
+    " matched EZ samples; fewer than MIN_OVERALL_N."
+  )
+}
+
+metadata_ez <- metadata_ez_all[
+  match(common_samples, metadata_ez_all$SampleID),
+  ,
+  drop = FALSE
+]
+
+if (any(!metadata_ez$Park %in% PARK_LEVELS)) {
+  stop(
+    "Unexpected Park labels: ",
+    paste(setdiff(unique(metadata_ez$Park), PARK_LEVELS), collapse = ", ")
+  )
+}
+
+if (any(!metadata_ez$Season %in% SEASON_LEVELS)) {
+  stop(
+    "Unexpected Season labels: ",
+    paste(setdiff(unique(metadata_ez$Season), SEASON_LEVELS), collapse = ", ")
+  )
+}
+
+bac_counts <- bac_counts_all[, common_samples, drop = FALSE]
+fun_counts <- fun_counts_all[, common_samples, drop = FALSE]
+
+
+# Sample matching/exclusion report.
+make_exclusion_rows <- function(domain, ids, reason) {
+  if (length(ids) == 0) {
+    return(data.frame(
+      Domain = character(),
+      SampleID = character(),
+      Reason = character(),
+      Park = character(),
+      Season = character(),
+      BrewingCycle_for_reporting = character()
+    ))
+  }
+
+  data.frame(
+    Domain = domain,
+    SampleID = ids,
+    Reason = reason,
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(
+      metadata_ez_all %>%
+        select(
+          SampleID, Park, Season, BrewingCycle_for_reporting
+        ),
+      by = "SampleID"
+    )
+}
+
+exclusion_report <- dplyr::bind_rows(
+  make_exclusion_rows("Bacteria", missing_bac, "Absent_from_ASV_table"),
+  make_exclusion_rows("Bacteria", zero_depth_bac, "Zero_library_size"),
+  make_exclusion_rows("Fungi", missing_fun, "Absent_from_ASV_table"),
+  make_exclusion_rows("Fungi", zero_depth_fun, "Zero_library_size")
+)
+
+write.csv(
+  exclusion_report,
+  file.path(OUTPUT_ROOT, "sample_exclusion_report.csv"),
+  row.names = FALSE
+)
+
+
+# Sample number and brewing-cycle coverage in each of the 12 Park x Season
+# combinations. A context is not required to contain both cycles.
+# Park x Season groups with fewer than MIN_GROUP_N samples remain missing
+# in the context-correlation table and heatmaps.
+cycle_composition <- metadata_ez %>%
+  count(Park, Season, BrewingCycle_for_reporting, name = "N_samples") %>%
+  arrange(Park, Season, BrewingCycle_for_reporting)
+
+cycle_composition_collapsed <- cycle_composition %>%
+  group_by(Park, Season) %>%
+  summarise(
+    Cycle_composition = paste(
+      paste0(BrewingCycle_for_reporting, "=", N_samples),
+      collapse = "; "
+    ),
+    .groups = "drop"
+  )
+
+sample_n <- expand.grid(
+  Season = SEASON_LEVELS,
+  Park = PARK_LEVELS,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(Context = paste(Park, Season, sep = "-")) %>%
+  left_join(
+    metadata_ez %>% count(Park, Season, name = "N_matched"),
+    by = c("Park", "Season")
+  ) %>%
+  left_join(
+    cycle_composition_collapsed,
+    by = c("Park", "Season")
+  ) %>%
+  mutate(
+    N_matched = tidyr::replace_na(N_matched, 0L),
+    Cycle_composition = tidyr::replace_na(Cycle_composition, "No matched samples"),
+    Evaluable = N_matched >= MIN_GROUP_N
+  )
+
+write.csv(
+  sample_n,
+  file.path(OUTPUT_ROOT, "sample_number_by_Park_Season.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  cycle_composition,
+  file.path(OUTPUT_ROOT, "matched_EZ_sample_cycle_composition.csv"),
+  row.names = FALSE
+)
+
+N_EVALUABLE_CONTEXTS <- sum(sample_n$Evaluable)
+
+if (N_EVALUABLE_CONTEXTS == 0) {
+  stop("No Park x Season group meets MIN_GROUP_N.")
+}
+```
+
+## Prevalence Filtering And Transformations
+
+```{r section-6, echo=TRUE, message=TRUE, warning=TRUE}
+############################
+## 5. PREVALENCE FILTERING AND TRANSFORMATIONS
+############################
+
+# Prevalence is calculated on the matched EZ samples, before transformation.
+bac_prevalence <- rowMeans(bac_counts > 0)
+fun_prevalence <- rowMeans(fun_counts > 0)
+
+bac_keep <- names(bac_prevalence)[bac_prevalence >= MIN_PREVALENCE]
+fun_keep <- names(fun_prevalence)[fun_prevalence >= MIN_PREVALENCE]
+
+if (length(bac_keep) < 2 || length(fun_keep) < 2) {
+  stop("Fewer than two ASVs remain in one domain after the 20% prevalence filter.")
+}
+
+bac_counts_filt <- bac_counts[bac_keep, , drop = FALSE]
+fun_counts_filt <- fun_counts[fun_keep, , drop = FALSE]
+
+if (any(colSums(bac_counts_filt) == 0) ||
+    any(colSums(fun_counts_filt) == 0)) {
+  stop("At least one sample has zero reads among prevalence-filtered ASVs.")
+}
+
+bac_tax <- read_taxonomy(BACTERIAL_TAX_FILE)
+fun_tax <- read_taxonomy(FUNGAL_TAX_FILE)
+stage_response <- read_stage_response(STAGE_RESPONSE_FILE)
+
+write.csv(
+  stage_response,
+  file.path(OUTPUT_ROOT, "stage_response_ASV_ID_normalized.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(
+    ASV_ID = names(bac_prevalence),
+    Prevalence = as.numeric(bac_prevalence),
+    Retained = names(bac_prevalence) %in% bac_keep
+  ),
+  file.path(OUTPUT_ROOT, "bacterial_ASV_prevalence.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(
+    ASV_ID = names(fun_prevalence),
+    Prevalence = as.numeric(fun_prevalence),
+    Retained = names(fun_prevalence) %in% fun_keep
+  ),
+  file.path(OUTPUT_ROOT, "fungal_ASV_prevalence.csv"),
+  row.names = FALSE
+)
+
+
+# CLR is calculated separately for bacteria and fungi after adding
+# the same fixed pseudocount to each retained raw ASV count.
+bac_clr <- clr_from_counts_pseudocount(
+  bac_counts_filt,
+  pseudocount = CLR_PSEUDOCOUNT
+)
+
+fun_clr <- clr_from_counts_pseudocount(
+  fun_counts_filt,
+  pseudocount = CLR_PSEUDOCOUNT
+)
+
+
+# Build the combined CLR matrix for ordinary-network correlations.
+# The same sample rows are retained; domain prefixes ensure unique node IDs.
+all_mat_clr <- make_combined_matrix(bac_clr, fun_clr)
+
+stopifnot(identical(rownames(all_mat_clr), metadata_ez$SampleID))
+
+
+# Node annotations for the CLR-Spearman network.
+node_info <- make_node_information(
+  bac_ids = bac_keep,
+  fun_ids = fun_keep,
+  bac_tax = bac_tax,
+  fun_tax = fun_tax,
+  stage_response = stage_response
+)
+
+write.csv(
+  node_info,
+  file.path(OUTPUT_ROOT, "all_retained_ASV_node_annotations.csv"),
+  row.names = FALSE
+)
+
+
+# Record the fixed settings once for reproducibility.
+settings <- data.frame(
+  Setting = c(
+    "Matched_EZ_samples",
+    "Bacterial_ASVs_retained",
+    "Fungal_ASVs_retained",
+    "Total_ASVs_retained",
+    "Prevalence_threshold",
+    "Correlation_threshold",
+    "BH_FDR_threshold",
+    "Minimum_context_sample_size_for_group_correlation_and_repeatability",
+    "Evaluable_Park_Season_contexts",
+    "Brewing_cycle_metadata_column",
+    "CLR_zero_handling",
+    "Network_type",
+    "BH_FDR_scope"
+  ),
+  Value = c(
+    length(common_samples),
+    length(bac_keep),
+    length(fun_keep),
+    length(bac_keep) + length(fun_keep),
+    MIN_PREVALENCE,
+    RHO_THRESHOLD,
+    FDR_THRESHOLD,
+    MIN_GROUP_N,
+    paste0(N_EVALUABLE_CONTEXTS, "/12"),
+    ifelse(is.na(cycle_source_column), "Not available", cycle_source_column),
+    paste0("Add ", CLR_PSEUDOCOUNT, " to retained raw ASV counts before CLR"),
+    "Ordinary undirected weighted network",
+    "All unique bacterial-bacterial, fungal-fungal and bacterial-fungal pairs"
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  settings,
+  file.path(OUTPUT_ROOT, "analysis_settings.csv"),
+  row.names = FALSE
+)
+
+message("Matched EZ samples: ", length(common_samples))
+message("Bacterial ASVs retained (prevalence >= 20%): ", length(bac_keep))
+message("Fungal ASVs retained (prevalence >= 20%): ", length(fun_keep))
+message("Total retained ASVs: ", length(bac_keep) + length(fun_keep))
+message("Evaluable Park x Season groups (n >= ", MIN_GROUP_N, "): ", N_EVALUABLE_CONTEXTS, "/12")
+```
+
+## Core Analysis Function: Clr-Spearman Ordinary Network
+
+```{r section-7, echo=TRUE, message=TRUE, warning=TRUE}
+############################
+## 6. CORE ANALYSIS FUNCTION: CLR-SPEARMAN ORDINARY NETWORK
+############################
+
+run_network_method <- function(
+    method_name,
+    all_mat,
+    out_dir,
+    method_title,
+    node_info,
+    metadata_ez) {
+
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  message("\nRunning method: ", method_name)
+
+  # Retain the original analysis function and group-size rule.
+  # Copy sample-context information and method settings into the CLR
+  # output folder for auditability.
+  write.csv(
+    sample_n,
+    file.path(out_dir, "sample_number_by_Park_Season.csv"),
+    row.names = FALSE
+  )
+  write.csv(
+    cycle_composition,
+    file.path(out_dir, "matched_EZ_sample_cycle_composition.csv"),
+    row.names = FALSE
+  )
+  method_settings <- data.frame(
+    Method = method_name,
+    Minimum_prevalence = MIN_PREVALENCE,
+    Minimum_Park_Season_n = MIN_GROUP_N,
+    Heatmap_max_associations_per_page = HEATMAP_MAX_ASSOCIATIONS_PER_PAGE,
+    Heatmap_PNG_dpi = HEATMAP_PNG_DPI,
+    Absolute_rho_threshold = RHO_THRESHOLD,
+    BH_FDR_threshold = FDR_THRESHOLD,
+    N_evaluable_Park_Season_groups = N_EVALUABLE_CONTEXTS,
+    stringsAsFactors = FALSE
+  )
+  write.csv(
+    method_settings,
+    file.path(out_dir, "method_analysis_settings.csv"),
+    row.names = FALSE
+  )
+
+  # Calculate the full Spearman correlation matrix among ALL retained ASVs.
+  # This includes within-bacteria, within-fungi and cross-domain correlations.
+  rho_mat <- stats::cor(
+    all_mat,
+    method = "spearman",
+    use = "pairwise.complete.obs"
+  )
+
+  p_mat <- spearman_p_matrix(rho_mat, nrow(all_mat))
+
+  # Extract one record for each unique undirected pair and apply one global
+  # BH correction across all pairwise tests.
+  all_pairs <- matrix_to_undirected_pairs(rho_mat, p_mat)
+
+  write.csv(
+    all_pairs,
+    file.path(out_dir, "all_pairwise_correlations.csv"),
+    row.names = FALSE
+  )
+
+  candidate_edges_raw <- all_pairs %>%
+    filter(
+      abs(rho) >= RHO_THRESHOLD,
+      FDR < FDR_THRESHOLD
+    ) %>%
+    arrange(FDR, desc(abs(rho)))
+
+  candidate_edges <- annotate_network_edges(
+    candidate_edges_raw,
+    node_info
+  )
+
+  stage_response_edge_summary <- summarize_stage_response_edges(
+    edge_table = candidate_edges,
+    node_info = node_info
+  )
+  candidate_edges <- stage_response_edge_summary$edges
+
+  write.csv(
+    stage_response_edge_summary$summary,
+    file.path(out_dir, "stage_response_edge_category_summary.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    stage_response_edge_summary$audit,
+    file.path(out_dir, "stage_response_edge_category_audit.csv"),
+    row.names = FALSE
+  )
+
+  if (nrow(candidate_edges) == 0) {
+    warning("No network edges passed the criteria for ", method_name)
+
+    # Export a complete node table even if no edges pass the thresholds.
+    nodes_no_edges <- node_info %>%
+      mutate(
+        In_network = FALSE,
+        Degree = 0,
+        Strength = 0,
+        Betweenness = 0,
+        Closeness = NA_real_,
+        Harmonic_centrality = 0,
+        Eigenvector_centrality_componentwise = NA_real_,
+        Component_ID = NA_integer_,
+        Component_size = NA_integer_,
+        Community_ID = NA_integer_,
+        Community_size = NA_integer_
+      )
+
+    write.csv(
+      candidate_edges,
+      file.path(out_dir, "overall_network_edges_annotated.csv"),
+      row.names = FALSE
+    )
+
+    write.csv(
+      nodes_no_edges,
+      file.path(out_dir, "overall_network_nodes_with_stage_response.csv"),
+      row.names = FALSE
+    )
+
+    write.csv(
+      nodes_no_edges %>%
+        select(
+          node_id, ASV_ID, Domain, Genus, Response,
+          Four_season_consistent, In_network, Degree, Strength,
+          Betweenness, Closeness, Harmonic_centrality,
+          Eigenvector_centrality_componentwise,
+          Component_ID, Component_size, Community_ID, Community_size
+        ),
+      file.path(out_dir, "network_node_metrics.csv"),
+      row.names = FALSE
+    )
+
+    write.csv(
+      data.frame(),
+      file.path(out_dir, "network_edge_metrics.csv"),
+      row.names = FALSE
+    )
+
+    writeLines(
+      "No edges passed both the absolute Spearman rho and BH-FDR thresholds; network topology and figures were not generated.",
+      con = file.path(out_dir, "no_network_edges.txt")
+    )
+
+    empty_summary <- data.frame(
+      Method = method_name,
+      N_samples = nrow(all_mat),
+      N_bacterial_ASVs = sum(node_info$Domain == "Bacteria"),
+      N_fungal_ASVs = sum(node_info$Domain == "Fungi"),
+      N_candidate_pairs_tested = nrow(all_pairs),
+      N_network_edges = 0,
+      N_network_nodes = 0,
+      N_retained_ASVs = nrow(node_info),
+      N_isolated_retained_ASVs = nrow(node_info),
+      N_Bacteria_Bacteria_edges = 0,
+      N_Fungi_Fungi_edges = 0,
+      N_Bacteria_Fungi_edges = 0,
+      N_positive_edges = 0,
+      N_negative_edges = 0,
+      Network_density_all_retained_ASVs = 0,
+      stringsAsFactors = FALSE
+    )
+
+    write.csv(
+      empty_summary,
+      file.path(out_dir, "network_summary.csv"),
+      row.names = FALSE
+    )
+
+    return(list(
+      method = method_name,
+      all_pairs = all_pairs,
+      edges = candidate_edges,
+      recurrent = candidate_edges,
+      nodes = nodes_no_edges,
+      context = data.frame(),
+      consistency = data.frame(),
+      summary = empty_summary
+    ))
+  }
+
+
+  ############################
+  ## 6.1 BUILD THE ORDINARY NETWORK
+  ############################
+
+  # Build vertices directly from the exact endpoints in the edge table.
+  # This guarantees every edge endpoint is present in igraph's vertex data.
+  graph_edges <- candidate_edges %>%
+    transmute(
+      # IMPORTANT: igraph::graph_from_data_frame() interprets the FIRST
+      # TWO columns as the source and target vertex IDs. Keep from/to first.
+      from = as.character(Node1),
+      to = as.character(Node2),
+      EdgeID = as.character(EdgeID),
+      rho = as.numeric(rho),
+      Weight = abs(as.numeric(rho)),
+      Direction = as.character(Direction),
+      Edge_type = as.character(Edge_type)
+    )
+
+  active_node_ids <- unique(c(graph_edges$from, graph_edges$to))
+
+  if (anyNA(active_node_ids) || any(active_node_ids == "")) {
+    stop("Missing or blank node IDs were found in the retained edge table.")
+  }
+
+  if (anyDuplicated(as.character(node_info$node_id))) {
+    stop("Duplicated node_id values were found in node_info.")
+  }
+
+  annotation_index <- match(
+    active_node_ids,
+    as.character(node_info$node_id)
+  )
+
+  missing_annotation_ids <- active_node_ids[is.na(annotation_index)]
+
+  if (length(missing_annotation_ids) > 0) {
+    write.csv(
+      data.frame(node_id = missing_annotation_ids),
+      file.path(out_dir, "network_nodes_missing_annotation_match.csv"),
+      row.names = FALSE
+    )
+    warning(
+      length(missing_annotation_ids),
+      " edge endpoint(s) did not match node_info; fallback annotations ",
+      "were used. See network_nodes_missing_annotation_match.csv."
+    )
+  }
+
+  get_node_annotation <- function(column, fallback) {
+    value <- as.character(fallback)
+    matched <- !is.na(annotation_index)
+
+    if (any(matched)) {
+      source_value <- as.character(
+        node_info[[column]][annotation_index[matched]]
+      )
+      bad <- is.na(source_value) | source_value == ""
+      source_value[bad] <- value[matched][bad]
+      value[matched] <- source_value
+    }
+
+    value
+  }
+
+  fallback_domain <- sub("\\|.*$", "", active_node_ids)
+  fallback_asv <- sub("^(Bacteria|Fungi)\\|", "", active_node_ids)
+
+  graph_vertices <- data.frame(
+    name = active_node_ids,
+    ASV_ID = get_node_annotation("ASV_ID", fallback_asv),
+    Domain = get_node_annotation("Domain", fallback_domain),
+    Genus = get_node_annotation(
+      "Genus", rep("Unclassified", length(active_node_ids))
+    ),
+    label = get_node_annotation("label", fallback_asv),
+    label_plot = get_node_annotation("label_plot", fallback_asv),
+    Response = get_node_annotation(
+      "Response", rep("No_stage_response", length(active_node_ids))
+    ),
+    Four_season_consistent = get_node_annotation(
+      "Four_season_consistent",
+      rep("Not_available", length(active_node_ids))
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  if (anyDuplicated(graph_vertices$name)) {
+    stop("Duplicated vertex names were generated for the ordinary network.")
+  }
+
+  missing_vertex_ids <- setdiff(
+    unique(c(graph_edges$from, graph_edges$to)),
+    graph_vertices$name
+  )
+
+  if (length(missing_vertex_ids) > 0) {
+    stop(
+      "Internal graph construction error: edge endpoints are still missing ",
+      "from graph_vertices: ",
+      paste(missing_vertex_ids, collapse = ", ")
+    )
+  }
+
+  active_nodes <- graph_vertices %>%
+    transmute(
+      node_id = name,
+      ASV_ID = ASV_ID,
+      Domain = Domain,
+      Genus = Genus,
+      label = label,
+      label_plot = label_plot,
+      Response = Response,
+      Four_season_consistent = Four_season_consistent
+    )
+
+  if (length(missing_annotation_ids) > 0) {
+    fallback_node_info <- active_nodes %>%
+      filter(node_id %in% missing_annotation_ids) %>%
+      transmute(
+        ASV_ID = ASV_ID,
+        Domain = Domain,
+        node_id = node_id,
+        Genus = Genus,
+        Response = Response,
+        Four_season_consistent = Four_season_consistent,
+        label = label,
+        label_plot = label_plot
+      )
+
+    node_info <- bind_rows(node_info, fallback_node_info) %>%
+      distinct(node_id, .keep_all = TRUE)
+  }
+
+  g <- igraph::graph_from_data_frame(
+    d = graph_edges,
+    directed = FALSE,
+    vertices = graph_vertices
+  )
+
+  if (igraph::is_directed(g)) {
+    stop("The generated network must be undirected.")
+  }
+
+  if (igraph::any_multiple(g)) {
+    stop("Duplicated undirected edges detected; check pair extraction.")
+  }
+
+
+  ############################
+  ## 6.2 CALCULATE NETWORK TOPOLOGY
+  ############################
+
+  topology <- calculate_network_topology(g)
+
+  # Keep all prevalence-filtered ASVs in the node table.
+  # ASVs without a retained edge are marked In_network = FALSE.
+  nodes_all <- node_info %>%
+    left_join(topology$nodes, by = "node_id") %>%
+    mutate(
+      In_network = node_id %in% active_node_ids,
+      Degree = tidyr::replace_na(Degree, 0),
+      Strength = tidyr::replace_na(Strength, 0),
+      Betweenness = tidyr::replace_na(Betweenness, 0),
+      Harmonic_centrality = tidyr::replace_na(Harmonic_centrality, 0)
+    )
+
+  nodes_active <- nodes_all %>%
+    filter(In_network)
+
+  candidate_edges <- candidate_edges %>%
+    left_join(topology$edges, by = "EdgeID")
+
+
+  ############################
+  ## 6.3 EXPORT EDGE, NODE AND TOPOLOGY TABLES
+  ############################
+
+  write.csv(
+    candidate_edges,
+    file.path(out_dir, "overall_network_edges_annotated.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    nodes_all,
+    file.path(out_dir, "overall_network_nodes_with_stage_response.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    nodes_all %>%
+      select(
+        node_id, ASV_ID, Domain, Genus, Response,
+        Four_season_consistent, In_network,
+        Degree, Strength, Betweenness, Closeness,
+        Harmonic_centrality, Eigenvector_centrality_componentwise,
+        Component_ID, Component_size, Community_ID, Community_size
+      ),
+    file.path(out_dir, "network_node_metrics.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    nodes_active,
+    file.path(out_dir, "network_nodes_in_graph.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    candidate_edges %>%
+      select(
+        EdgeID, Node1, Node2, Domain1, Domain2, ASV1, ASV2,
+        Genus1, Genus2, Edge_type, rho, P_value, FDR,
+        Direction, Weight, Distance, Edge_betweenness
+      ),
+    file.path(out_dir, "network_edge_metrics.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    topology$community_summary,
+    file.path(out_dir, "network_community_summary.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    topology$component_summary,
+    file.path(out_dir, "network_component_summary.csv"),
+    row.names = FALSE
+  )
+
+  write_network_metric_definitions(out_dir)
+
+
+  ############################
+  ## 6.4 OVERALL NETWORK FIGURE
+  ############################
+
+  # Pass weights explicitly; topology-function graph attributes are local.
+  set.seed(RANDOM_SEED)
+
+  if (tolower(NETWORK_LAYOUT_METHOD) == "kk") {
+    layout_xy <- igraph::layout_with_kk(
+      g,
+      weights = 1 / pmax(abs(igraph::E(g)$rho), 1e-8),
+      maxiter = 1000
+    )
+  } else {
+    layout_xy <- igraph::layout_with_fr(
+      g,
+      weights = abs(igraph::E(g)$rho),
+      niter = 5000
+    )
+  }
+
+  node_plot <- data.frame(
+    node_id = igraph::V(g)$name,
+    x = layout_xy[, 1],
+    y = layout_xy[, 2],
+    degree = as.numeric(igraph::degree(g)),
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(nodes_active, by = "node_id")
+
+  edge_plot <- candidate_edges %>%
+    left_join(
+      node_plot %>% select(node_id, x, y),
+      by = c("Node1" = "node_id")
+    ) %>%
+    rename(x1 = x, y1 = y) %>%
+    left_join(
+      node_plot %>% select(node_id, x, y),
+      by = c("Node2" = "node_id")
+    ) %>%
+    rename(x2 = x, y2 = y)
+
+  label_nodes <- node_plot %>%
+    arrange(desc(degree)) %>%
+    slice_head(n = min(MAX_NODE_LABELS, nrow(node_plot)))
+
+  p_network <- ggplot() +
+    geom_segment(
+      data = edge_plot,
+      aes(
+        x = x1, y = y1,
+        xend = x2, yend = y2,
+        color = Direction,
+        linetype = Edge_type,
+        linewidth = abs(rho)
+      ),
+      alpha = 0.48
+    ) +
+    geom_point(
+      data = node_plot,
+      aes(
+        x = x, y = y,
+        size = degree,
+        shape = Domain,
+        fill = Response
+      ),
+      color = "grey25",
+      stroke = 0.65
+    ) +
+    ggrepel::geom_text_repel(
+      data = label_nodes,
+      aes(x = x, y = y, label = label_plot),
+      size = 2.8,
+      max.overlaps = Inf,
+      box.padding = 0.45,
+      point.padding = 0.30,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(
+      values = c(Positive = "#238B82", Negative = "#D17A4A"),
+      name = "Association direction"
+    ) +
+    scale_linetype_manual(
+      values = c(
+        "Bacteria-Bacteria" = "solid",
+        "Fungi-Fungi" = "dashed",
+        "Bacteria-Fungi" = "dotdash"
+      ),
+      name = "Connected domains"
+    ) +
+    scale_fill_manual(
+      values = c(
+        EZ_depleted = "#C85B55",
+        EZ_enriched = "#4C91C6",
+        No_stage_response = "grey82"
+      ),
+      breaks = c("EZ_depleted", "EZ_enriched", "No_stage_response"),
+      labels = c("EZ-depleted", "EZ-enriched", "No-stage-response"),
+      name = "Stage response",
+      # Explicitly use filled circles in this legend. Without this override,
+      # ggplot2 may draw the fill legend keys with a non-fillable point shape.
+      guide = ggplot2::guide_legend(
+        override.aes = list(
+          shape = 21,
+          colour = "grey25",
+          fill = c("#C85B55", "#4C91C6", "grey82"),
+          size = 4,
+          alpha = 1,
+          stroke = 0.7
+        )
+      )
+    ) +
+    scale_shape_manual(
+      values = c(Bacteria = 21, Fungi = 22),
+      name = "Domain"
+    ) +
+    scale_size_continuous(
+      range = c(2.2, 7),
+      name = "Degree"
+    ) +
+    scale_linewidth_continuous(
+      range = c(0.2, 1.1),
+      guide = "none"
+    ) +
+    labs(
+      title = paste0("EZ ordinary microbial co-occurrence network: ", method_title),
+      subtitle = paste0(
+        "Prevalence >= 20%; |Spearman's rho| >= ", RHO_THRESHOLD,
+        "; global BH-FDR < ", FDR_THRESHOLD,
+        "; node colours indicate EZ stage-response category"
+      )
+    ) +
+    coord_equal() +
+    theme_void(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 9),
+      legend.position = "bottom",
+      plot.margin = margin(15, 20, 15, 20)
+    )
+
+  save_plot_all_formats(
+    p_network,
+    file.path(out_dir, "Fig_A_overall_EZ_ordinary_cooccurrence_network"),
+    NETWORK_PLOT_WIDTH,
+    NETWORK_PLOT_HEIGHT
+  )
+
+
+  ############################
+  ## 6.5 PARK x SEASON CORRELATION REPEATABILITY
+  ############################
+
+  # Recalculate the same overall-network edges within each Park x Season group.
+  # The selected edge set is fixed from the overall network; group-wise
+  # correlations are used to evaluate directional repeatability.
+  context_grid <- expand.grid(
+    Season = SEASON_LEVELS,
+    Park = PARK_LEVELS,
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(Context = paste(Park, Season, sep = "-")) %>%
+    left_join(
+      sample_n %>% select(Park, Season, N_matched, Cycle_composition),
+      by = c("Park", "Season")
+    )
+
+  context_rows <- vector(
+    "list",
+    nrow(candidate_edges) * nrow(context_grid)
+  )
+
+  k <- 1L
+
+  for (i in seq_len(nrow(candidate_edges))) {
+    node1_i <- candidate_edges$Node1[i]
+    node2_i <- candidate_edges$Node2[i]
+
+    for (j in seq_len(nrow(context_grid))) {
+      park_j <- context_grid$Park[j]
+      season_j <- context_grid$Season[j]
+
+      idx <- which(
+        metadata_ez$Park == park_j &
+          metadata_ez$Season == season_j
+      )
+
+      # Preserve the original missing-data rule: groups with fewer than
+      # MIN_GROUP_N (= 5) matched samples remain NA and appear as missing
+      # (grey) heatmap cells.
+      if (length(idx) < MIN_GROUP_N) {
+        est <- list(rho = NA_real_, n = length(idx))
+      } else {
+        est <- safe_spearman(
+          all_mat[idx, node1_i],
+          all_mat[idx, node2_i],
+          min_n = MIN_GROUP_N
+        )
+      }
+
+      context_rows[[k]] <- data.frame(
+        EdgeID = candidate_edges$EdgeID[i],
+        Node1 = node1_i,
+        Node2 = node2_i,
+        Domain1 = candidate_edges$Domain1[i],
+        Domain2 = candidate_edges$Domain2[i],
+        ASV1 = candidate_edges$ASV1[i],
+        ASV2 = candidate_edges$ASV2[i],
+        Genus1 = candidate_edges$Genus1[i],
+        Genus2 = candidate_edges$Genus2[i],
+        Edge_type = candidate_edges$Edge_type[i],
+        EdgeLabel = candidate_edges$EdgeLabel[i],
+        Overall_rho = candidate_edges$rho[i],
+        Park = park_j,
+        Season = season_j,
+        Context = context_grid$Context[j],
+        N_context_matched = context_grid$N_matched[j],
+        BrewingCycle_composition = context_grid$Cycle_composition[j],
+        rho = est$rho,
+        n = est$n,
+        stringsAsFactors = FALSE
+      )
+
+      k <- k + 1L
+    }
+  }
+
+  context_correlations <- bind_rows(context_rows)
+
+  context_correlations$Context <- factor(
+    context_correlations$Context,
+    levels = context_grid$Context
+  )
+
+  write.csv(
+    context_correlations,
+    file.path(out_dir, "context_specific_correlations_12_groups.csv"),
+    row.names = FALSE
+  )
+
+
+  ############################
+  ## 6.6 DIRECTIONAL CONSISTENCY
+  ############################
+
+  consistency_rows <- lapply(
+    seq_len(nrow(candidate_edges)),
+    function(i) {
+
+      edge_id <- candidate_edges$EdgeID[i]
+
+      tmp <- context_correlations %>%
+        filter(EdgeID == edge_id)
+
+      # Only groups with at least MIN_GROUP_N samples contribute to
+      # directional-repeatability assessment. Smaller groups remain missing
+      # in the heatmap and are not used to define recurrent associations.
+      valid <- tmp %>%
+        filter(
+          N_context_matched >= MIN_GROUP_N,
+          is.finite(rho)
+        )
+
+      n_valid <- nrow(valid)
+
+      n_same <- if (n_valid > 0) {
+        sum(sign(valid$rho) == sign(candidate_edges$rho[i]))
+      } else {
+        0L
+      }
+
+      data.frame(
+        EdgeID = edge_id,
+        Node1 = candidate_edges$Node1[i],
+        Node2 = candidate_edges$Node2[i],
+        Domain1 = candidate_edges$Domain1[i],
+        Domain2 = candidate_edges$Domain2[i],
+        ASV1 = candidate_edges$ASV1[i],
+        ASV2 = candidate_edges$ASV2[i],
+        Genus1 = candidate_edges$Genus1[i],
+        Genus2 = candidate_edges$Genus2[i],
+        Edge_type = candidate_edges$Edge_type[i],
+        EdgeLabel = candidate_edges$EdgeLabel[i],
+        Overall_rho = candidate_edges$rho[i],
+        Overall_FDR = candidate_edges$FDR[i],
+        n_valid_contexts = n_valid,
+        n_same_direction = n_same,
+        Direction_consistency = if (n_valid > 0) {
+          n_same / n_valid
+        } else {
+          NA_real_
+        },
+        Recurrent_all_evaluable_contexts = (
+          n_valid == N_EVALUABLE_CONTEXTS &&
+            n_same == N_EVALUABLE_CONTEXTS
+        ),
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+
+  consistency_summary <- bind_rows(consistency_rows) %>%
+    arrange(
+      desc(Recurrent_all_evaluable_contexts),
+      desc(Direction_consistency),
+      desc(abs(Overall_rho))
+    )
+
+  write.csv(
+    consistency_summary,
+    file.path(out_dir, "directional_consistency_summary.csv"),
+    row.names = FALSE
+  )
+
+  recurrent <- consistency_summary %>%
+    filter(Recurrent_all_evaluable_contexts) %>%
+    left_join(
+      candidate_edges %>%
+        select(
+          EdgeID, Response1, Response2,
+          FourSeason1, FourSeason2, Direction
+        ),
+      by = "EdgeID"
+    )
+
+  write.csv(
+    recurrent,
+    file.path(out_dir, "recurrent_associations_all_evaluable_contexts.csv"),
+    row.names = FALSE
+  )
+
+
+  ############################
+  ## 6.7 RECURRENT-ASSOCIATION HEATMAPS
+  ############################
+
+  if (nrow(recurrent) > 0) {
+
+    # Both heatmaps are based on the same set of associations that retain
+    # their overall correlation direction in every evaluable Park x Season
+    # context. The second heatmap displays the 30 strongest by |overall rho|.
+    make_recurrent_heatmap <- function(
+        recurrent_subset,
+        file_stem,
+        plot_title,
+        plot_subtitle) {
+
+      recurrent_subset <- recurrent_subset %>%
+        arrange(desc(abs(Overall_rho)), desc(Overall_rho), EdgeID)
+
+      edge_order <- as.character(recurrent_subset$EdgeID)
+      edge_labels <- setNames(
+        as.character(recurrent_subset$EdgeLabel),
+        edge_order
+      )
+
+      plot_data <- context_correlations %>%
+        filter(EdgeID %in% edge_order) %>%
+        mutate(
+          EdgeID = factor(
+            as.character(EdgeID),
+            levels = rev(edge_order)
+          )
+        )
+
+      # Each heatmap contains no more than HEATMAP_MAX_ASSOCIATIONS_PER_PAGE
+      # rows. The original row height and label size are retained; no image
+      # compression or resolution reduction is applied.
+      heatmap_height <- max(
+        6,
+        2.5 + 0.24 * nrow(recurrent_subset)
+      )
+      y_label_size <- 7.5
+
+      p_heatmap <- ggplot(
+        plot_data,
+        aes(x = Context, y = EdgeID, fill = rho)
+      ) +
+        geom_tile(color = "white", linewidth = 0.35) +
+        scale_y_discrete(labels = edge_labels) +
+        scale_fill_gradient2(
+          low = "#D17A4A",
+          mid = "white",
+          high = "#238B82",
+          midpoint = 0,
+          limits = c(-1, 1),
+          na.value = "grey88",
+          name = "Spearman's rho"
+        ) +
+        labs(
+          title = plot_title,
+          subtitle = plot_subtitle,
+          x = NULL,
+          y = NULL
+        ) +
+        theme_bw(base_size = 10) +
+        theme(
+          plot.title = element_text(face = "bold", size = 12),
+          plot.subtitle = element_text(size = 9),
+          axis.text.x = element_text(
+            angle = 45,
+            hjust = 1,
+            vjust = 1
+          ),
+          axis.text.y = element_text(size = y_label_size),
+          panel.grid = element_blank(),
+          legend.position = "right"
+        )
+
+      message(
+        "Saving heatmap ", basename(file_stem),
+        ": ", nrow(recurrent_subset), " associations; height = ",
+        round(heatmap_height, 1), " in; PNG dpi = ", HEATMAP_PNG_DPI,
+        "."
+      )
+
+      save_plot_all_formats(
+        p_heatmap,
+        file_stem,
+        width = 11,
+        height = heatmap_height,
+        dpi = HEATMAP_PNG_DPI
+      )
+
+      data.frame(
+        File_stem = basename(file_stem),
+        N_associations = nrow(recurrent_subset),
+        Height_inches = heatmap_height,
+        Y_axis_label_size = y_label_size,
+        PNG_dpi = HEATMAP_PNG_DPI,
+        stringsAsFactors = FALSE
+      )
+    }
+
+    recurrent_all <- recurrent %>%
+      arrange(desc(abs(Overall_rho)), desc(Overall_rho), EdgeID)
+
+    # Split the complete recurrent-association set into consecutive pages.
+    # Ranking is retained across pages: the strongest overall associations
+    # appear first. The original page-size parameter is retained.
+    page_index_groups <- split(
+      seq_len(nrow(recurrent_all)),
+      ceiling(seq_len(nrow(recurrent_all)) / HEATMAP_MAX_ASSOCIATIONS_PER_PAGE)
+    )
+    n_all_pages <- length(page_index_groups)
+
+    all_heatmap_manifest <- lapply(
+      seq_along(page_index_groups),
+      function(page_i) {
+        page_indices <- page_index_groups[[page_i]]
+        page_subset <- recurrent_all[page_indices, , drop = FALSE]
+        rank_start <- min(page_indices)
+        rank_end <- max(page_indices)
+
+        file_stem <- file.path(
+          out_dir,
+          sprintf(
+            "Fig_B1_recurrent_association_heatmap_ALL_part_%02d_of_%02d",
+            page_i, n_all_pages
+          )
+        )
+
+        page_manifest <- make_recurrent_heatmap(
+          recurrent_subset = page_subset,
+          file_stem = file_stem,
+          plot_title = paste0(
+            "All recurrent associations (part ", page_i, "/", n_all_pages,"): ",
+            method_title
+          ),
+          plot_subtitle = paste0(
+            "Associations ranked by absolute overall Spearman rho; rows ",
+            rank_start, "–", rank_end, " of ", nrow(recurrent_all)
+          )
+        )
+
+        page_manifest$Plot_type <- "ALL_recurrent_associations"
+        page_manifest$Page <- page_i
+        page_manifest$Total_pages <- n_all_pages
+        page_manifest$Rank_start <- rank_start
+        page_manifest$Rank_end <- rank_end
+        page_manifest
+      }
+    ) %>%
+      bind_rows()
+
+    # Keep the separate top-30 overview figure, using the same 300-dpi
+    # export settings as every page of the complete heatmap.
+    top30_recurrent <- recurrent_all %>%
+      slice_head(n = min(30L, nrow(recurrent_all)))
+
+    top30_file_stem <- file.path(
+      out_dir,
+      "Fig_B2_recurrent_association_heatmap_TOP30"
+    )
+
+    top30_manifest <- make_recurrent_heatmap(
+      recurrent_subset = top30_recurrent,
+      file_stem = top30_file_stem,
+      plot_title = paste0("Top recurrent associations: ", method_title),
+      plot_subtitle = paste0(
+        "Top ", nrow(top30_recurrent), " of ", nrow(recurrent_all),
+        " recurrent associations, ranked by absolute overall Spearman rho"
+      )
+    )
+    top30_manifest$Plot_type <- "TOP30_recurrent_associations"
+    top30_manifest$Page <- 1L
+    top30_manifest$Total_pages <- 1L
+    top30_manifest$Rank_start <- 1L
+    top30_manifest$Rank_end <- nrow(top30_recurrent)
+
+    heatmap_manifest <- bind_rows(
+      all_heatmap_manifest,
+      top30_manifest
+    ) %>%
+      select(
+        File_stem, Plot_type, Page, Total_pages,
+        Rank_start, Rank_end, N_associations,
+        Height_inches, Y_axis_label_size, PNG_dpi
+      )
+
+    write.csv(
+      heatmap_manifest,
+      file.path(out_dir, "recurrent_association_heatmap_manifest.csv"),
+      row.names = FALSE
+    )
+
+  } else {
+
+    writeLines(
+      paste0(
+        "No association retained the same direction in all ",
+        N_EVALUABLE_CONTEXTS,
+        " evaluable Park x Season groups."
+      ),
+      con = file.path(out_dir, "heatmap_not_generated.txt")
+    )
+  }
+
+
+  ############################
+  ## 6.8 RUMINococcus-ASSOCIATED ASSOCIATIONS
+  ############################
+
+  ruminococcus_all <- candidate_edges %>%
+    filter(
+      tolower(Genus1) == "ruminococcus" |
+        tolower(Genus2) == "ruminococcus"
+    )
+
+  ruminococcus_recurrent <- recurrent %>%
+    filter(
+      tolower(Genus1) == "ruminococcus" |
+        tolower(Genus2) == "ruminococcus"
+    )
+
+  write.csv(
+    ruminococcus_all,
+    file.path(out_dir, "Ruminococcus_all_network_associations.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    ruminococcus_recurrent,
+    file.path(out_dir, "Ruminococcus_recurrent_associations.csv"),
+    row.names = FALSE
+  )
+
+
+  ############################
+  ## 6.9 NETWORK SUMMARY
+  ############################
+
+  graph_components <- igraph::components(g)
+
+  edge_type_counts <- table(
+    factor(
+      candidate_edges$Edge_type,
+      levels = c(
+        "Bacteria-Bacteria",
+        "Fungi-Fungi",
+        "Bacteria-Fungi"
+      )
+    )
+  )
+
+  n_possible_pairs_all_retained <- choose(nrow(node_info), 2)
+  density_all_retained <- if (n_possible_pairs_all_retained > 0) {
+    nrow(candidate_edges) / n_possible_pairs_all_retained
+  } else {
+    NA_real_
+  }
+
+  network_summary <- data.frame(
+    Method = method_name,
+    N_samples = nrow(all_mat),
+    N_bacterial_ASVs = sum(node_info$Domain == "Bacteria"),
+    N_fungal_ASVs = sum(node_info$Domain == "Fungi"),
+    N_retained_ASVs = nrow(node_info),
+    N_candidate_pairs_tested = nrow(all_pairs),
+    N_network_edges = nrow(candidate_edges),
+    N_network_nodes = igraph::vcount(g),
+    N_isolated_retained_ASVs = nrow(node_info) - igraph::vcount(g),
+    N_bacterial_nodes = sum(nodes_active$Domain == "Bacteria"),
+    N_fungal_nodes = sum(nodes_active$Domain == "Fungi"),
+    N_Bacteria_Bacteria_edges = as.integer(edge_type_counts["Bacteria-Bacteria"]),
+    N_Fungi_Fungi_edges = as.integer(edge_type_counts["Fungi-Fungi"]),
+    N_Bacteria_Fungi_edges = as.integer(edge_type_counts["Bacteria-Fungi"]),
+    N_positive_edges = sum(candidate_edges$rho > 0),
+    N_negative_edges = sum(candidate_edges$rho < 0),
+    N_connected_components = graph_components$no,
+    Largest_component_nodes = max(graph_components$csize),
+    N_recurrent_edges = nrow(recurrent),
+    Network_density_all_retained_ASVs = density_all_retained,
+    stringsAsFactors = FALSE
+  ) %>%
+    bind_cols(topology$summary)
+
+  write.csv(
+    network_summary,
+    file.path(out_dir, "network_summary.csv"),
+    row.names = FALSE
+  )
+
+  list(
+    method = method_name,
+    all_pairs = all_pairs,
+    edges = candidate_edges,
+    recurrent = recurrent,
+    nodes = nodes_all,
+    context = context_correlations,
+    consistency = consistency_summary,
+    summary = network_summary
+  )
+}
+```
+
+## Run Clr-Spearman
+
+```{r section-8, echo=TRUE, message=TRUE, warning=TRUE}
+############################
+## 7. RUN CLR-SPEARMAN
+############################
+
+# PRIMARY analysis: compositional data handled by independent CLR transforms.
+clr_result <- run_network_method(
+  method_name = "CLR-Spearman",
+  all_mat = all_mat_clr,
+  out_dir = CLR_DIR,
+  method_title = "CLR-Spearman (primary)",
+  node_info = node_info,
+  metadata_ez = metadata_ez
+)
+```
+
+## Session Information And Completion
+
+```{r section-9, echo=TRUE, message=TRUE, warning=TRUE}
+############################
+## 8. SESSION INFORMATION AND COMPLETION
+############################
+
+# Do not print a success message if the analysis failed before returning.
+if (!exists("clr_result", inherits = FALSE)) {
+  stop(
+    "Analysis is incomplete: CLR-Spearman did not finish successfully. ",
+    "Do not interpret the outputs ",
+    "as a completed analysis."
+  )
+}
+
+if (is.null(clr_result$summary)) {
+  stop("Analysis is incomplete: the CLR-Spearman summary is missing.")
+}
+
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(OUTPUT_ROOT, "sessionInfo.txt")
+)
+
+writeLines(
+  c(
+    "Analysis completed successfully.",
+    paste0("CLR-Spearman edges: ", nrow(clr_result$edges)),
+    paste0("CLR-Spearman recurrent edges: ", nrow(clr_result$recurrent))
+  ),
+  con = file.path(OUTPUT_ROOT, "ANALYSIS_COMPLETED_SUCCESSFULLY.txt")
+)
+
+message("\nAnalysis completed successfully.")
+message("CLR-Spearman primary results: ", CLR_DIR)
+message(
+  "Brewing-cycle coverage: ",
+  file.path(OUTPUT_ROOT, "sample_number_by_Park_Season.csv")
+)
+message(
+  "Stage-response edge category summaries are saved in the CLR-Spearman folder."
+)
+message(
+  "Network type: ordinary undirected weighted network; ",
+  "Bacteria-Bacteria, Fungi-Fungi and Bacteria-Fungi edges are allowed."
+)
+message(
+  "Network metrics exported: Degree, Strength, Betweenness, Closeness, ",
+  "Harmonic centrality, component-wise Eigenvector centrality, ",
+  "edge betweenness, Louvain communities, weighted modularity, ",
+  "network density, transitivity and domain assortativity."
+)
+message(
+  "BH-FDR was calculated once across all unique undirected ASV pairs ",
+  "in the CLR-Spearman network."
+)
+```
