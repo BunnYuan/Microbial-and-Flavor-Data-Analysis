@@ -1,0 +1,2392 @@
+---
+title: "iCAMP Analysis of BZ and EZ Bacterial ASV Communities Across Brewing Cycles"
+output:
+  github_document:
+    toc: true
+    toc_depth: 3
+---
+
+# Overview
+
+This R Markdown document provides the iCAMP workflow used to analyze
+community assembly in **BZ and EZ** across two complete brewing cycles,
+four brewing seasons, and the Park(Workshop) production backgrounds.
+
+## Main result levels
+
+The workflow produces:
+
+- overall BZ/EZ assembly-process profiles;
+- Season × SampleType context summaries;
+- BrewingCycle × Season × SampleType cross-cycle reproducibility summaries;
+- Context-level results, where
+  `Context_SampleType = BrewingCycle × Season × Park × SampleType`;
+- bin-level `Wtuvk`, `Ptk`, `BPtk`, `BRPtk`, and `Binwt` results;
+- ASV-to-bin membership and a representative-bin phylogenetic tree.
+
+The five mutually exclusive iCAMP processes are standardized as `HeS`, `HoS`,
+`DL`, `HD`, and `DR_Others`. `DR_Others` denotes drift plus other
+weak/undominated processes and should not be interpreted as pure drift.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r initialize}
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+```
+
+## 0. User parameters
+
+```{r parameters}
+work_dir <- "."
+asv_file  <- "ASV_table.tsv"
+tree_file <- "tree.nwk"
+meta_file <- "sample_metadata.xlsx"
+tax_file  <- "taxonomy.tsv"  # optional
+
+meta_sheet <- NULL
+
+## Resolve paths once; knitr restores setwd() changes between chunks.
+work_dir <- normalizePath(work_dir, winslash = "/", mustWork = TRUE)
+resolve_input_path <- function(path) {
+  if (grepl("^(/|[A-Za-z]:|~|\\\\)", path)) return(path.expand(path))
+  file.path(work_dir, path)
+}
+asv_file <- resolve_input_path(asv_file)
+tree_file <- resolve_input_path(tree_file)
+meta_file <- resolve_input_path(meta_file)
+if (nzchar(tax_file)) tax_file <- resolve_input_path(tax_file)
+
+out_dir <- file.path(work_dir, "BZ_EZ_iCAMP_output")
+pd_dir  <- file.path(out_dir, "pd_big")
+
+core_cycles <- c("Cycle1", "Cycle2")
+target_sample_types <- c("BZ", "EZ")
+season_levels <- c("Spring", "Summer", "Autumn", "Winter")
+
+## Main iCAMP settings
+rand_time <- 1000
+nworker <- 4
+memory_G <- 50
+bin_size_limit <- 24
+sig_index <- "SES.RC"
+phylo_metric <- "bMPD"
+
+## Output control: keep only results needed for interpretation/reproducibility.
+## Turn save_diagnostics = TRUE only when troubleshooting.
+## Bin-level analysis is ALWAYS run in the primary analysis.
+save_diagnostics <- FALSE
+save_png <- FALSE
+
+## Optional sensitivity analysis for phylogenetic-bin size
+run_bin_size_sensitivity <- FALSE
+sensitivity_bin_sizes <- c(12, 24, 48)
+
+## Optional sensitivity analysis for ASV prevalence.
+## These thresholds are numbers of core samples in which an ASV is detected.
+## The primary analysis uses NO prevalence filter beyond nonzero + tree matching.
+run_prevalence_sensitivity <- FALSE
+sensitivity_min_prevalence_n <- c(3, 9)
+
+## Optional sensitivity analysis using independent BZ / EZ regional pools.
+## These analyses start from the unfiltered core ASV matrix and rematch each
+## sample type to the original phylogenetic tree independently.
+run_stage_specific_pool_sensitivity <- FALSE
+
+group_cols_to_boot <- c("SampleType")
+
+context_nperm <- 9999
+seed_main <- 20260721
+
+## Coverage warnings are diagnostic only and do not filter ASVs.
+tree_abundance_coverage_warning <- 0.80
+per_sample_tree_coverage_warning <- 0.50
+taxonomy_coverage_warning <- 0.95
+```
+
+## 1. Package checks
+
+```{r package-checks}
+required_packages <- c(
+  "iCAMP",
+  "ape",
+  "vegan",
+  "data.table",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "readr",
+  "stringr",
+  "patchwork",
+  "readxl"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required R packages: ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running this supplementary script."
+  )
+}
+
+suppressPackageStartupMessages({
+  library(iCAMP)
+  library(ape)
+  library(vegan)
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(readr)
+  library(stringr)
+  library(patchwork)
+})
+
+if (!exists("icamp.big", where = asNamespace("iCAMP"), inherits = FALSE)) {
+  stop("The installed iCAMP package does not provide icamp.big().")
+}
+
+if (!requireNamespace("ggtree", quietly = TRUE)) {
+  message("ggtree is not installed. Representative-bin trees will still be saved with ape.")
+}
+```
+
+## 2. Output directories
+
+Create the main output and phylogenetic-distance directories. The `pd_big` cache is rebuilt for a full run to avoid reuse across incompatible trees.
+
+```{r output-directories}
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+## Rebuild the phylogenetic-distance backing files on every full run.
+## icamp.big() otherwise reuses an existing pd.desc file even if the input tree changed.
+if (dir.exists(pd_dir)) {
+  unlink(pd_dir, recursive = TRUE, force = TRUE)
+}
+dir.create(pd_dir, showWarnings = FALSE, recursive = TRUE)
+
+message("Working directory: ", work_dir)
+message("Output directory: ", out_dir)
+```
+
+## 3. Helper functions
+
+Define input readers, season normalization, strict count validation, process-name standardization, diagnostic writers, and bin-ID helpers.
+
+```{r helper-functions}
+read_auto <- function(path, sheet = NULL) {
+  if (!file.exists(path)) stop("File not found: ", path)
+  ext <- tolower(tools::file_ext(path))
+
+  if (ext == "csv") {
+    return(
+      as.data.frame(
+        readr::read_csv(path, show_col_types = FALSE, name_repair = "minimal"),
+        check.names = FALSE
+      )
+    )
+  }
+
+  if (ext %in% c("tsv", "txt")) {
+    return(
+      as.data.frame(
+        readr::read_tsv(path, show_col_types = FALSE, name_repair = "minimal"),
+        check.names = FALSE
+      )
+    )
+  }
+
+  if (ext %in% c("xlsx", "xls")) {
+    if (!requireNamespace("readxl", quietly = TRUE)) {
+      stop("Package 'readxl' is required for Excel metadata files.")
+    }
+    sheets <- readxl::excel_sheets(path)
+    if (is.null(sheet)) sheet <- sheets[1]
+    return(
+      as.data.frame(
+        readxl::read_excel(path, sheet = sheet, .name_repair = "minimal"),
+        check.names = FALSE
+      )
+    )
+  }
+
+  stop("Unsupported file extension: ", ext)
+}
+
+normalize_season <- function(x) {
+  x <- trimws(as.character(x))
+
+  key <- tolower(x)
+  map <- c(
+    "spring" = "Spring",
+    "summer" = "Summer",
+    "autumn" = "Autumn",
+    "fall" = "Autumn",
+    "winter" = "Winter"
+  )
+
+  hit <- key %in% names(map)
+  x[hit] <- unname(map[key[hit]])
+  x
+}
+
+## Fixed study-design mapping used only for strict QC of BrewingCycle labels.
+derive_expected_brewing_cycle <- function(year, season) {
+  y <- suppressWarnings(as.integer(as.numeric(as.character(year))))
+  s <- normalize_season(season)
+  out <- rep(NA_character_, length(y))
+
+  out[y == 2023 & s %in% c("Summer", "Autumn", "Winter")] <- "Cycle1"
+  out[y == 2024 & s == "Spring"] <- "Cycle1"
+  out[y == 2024 & s %in% c("Summer", "Autumn", "Winter")] <- "Cycle2"
+  out[y == 2025 & s == "Spring"] <- "Cycle2"
+
+  out
+}
+
+as_numeric_matrix_strict <- function(x, object_name = "ASV count table") {
+  raw <- as.matrix(x)
+
+  suppressWarnings(
+    num <- matrix(
+      as.numeric(raw),
+      nrow = nrow(raw),
+      ncol = ncol(raw),
+      dimnames = dimnames(raw)
+    )
+  )
+
+  raw_chr <- trimws(as.character(raw))
+  bad <- is.na(as.vector(num)) &
+    !is.na(as.vector(raw)) &
+    nzchar(raw_chr) &
+    !toupper(raw_chr) %in% c("NA", "NAN")
+
+  if (any(bad)) {
+    bad_values <- unique(raw_chr[bad])
+    stop(
+      object_name,
+      " contains non-numeric entries, for example: ",
+      paste(head(bad_values, 10), collapse = ", "),
+      ". The ASV table must contain raw counts only."
+    )
+  }
+
+  if (any(!is.finite(num))) {
+    stop(object_name, " contains NA/NaN/Inf values.")
+  }
+
+  if (any(num < 0)) {
+    stop(object_name, " contains negative values.")
+  }
+
+  if (any(abs(num - round(num)) > 1e-8)) {
+    stop(
+      object_name,
+      " contains non-integer values. iCAMP should be run on the raw ASV count matrix."
+    )
+  }
+
+  num
+}
+
+safe_write_csv <- function(x, file, row_names = TRUE) {
+  if (is.null(x)) return(NULL)
+  tryCatch(
+    write.csv(as.data.frame(x), file, row.names = row_names),
+    error = function(e) {
+      stop("Unable to save required output: ", file, "; reason: ", conditionMessage(e))
+    }
+  )
+}
+
+write_diagnostic_csv <- function(x, file, row_names = FALSE) {
+  if (isTRUE(save_diagnostics)) {
+    write.csv(as.data.frame(x), file, row.names = row_names)
+  }
+}
+
+process_order <- c("HeS", "HoS", "DL", "HD", "DR_Others")
+
+clean_process_name <- function(x) {
+  raw <- trimws(as.character(x))
+  key <- gsub("[^a-z0-9]+", "", tolower(raw))
+  out <- raw
+
+  out[key %in% c("heterogeneousselection", "hes")] <- "HeS"
+  out[key %in% c("homogeneousselection", "hos")] <- "HoS"
+  out[key %in% c("dispersallimitation", "dl")] <- "DL"
+  out[key %in% c("homogenizingdispersal", "hd")] <- "HD"
+  out[key %in% c(
+    "driftandothers", "driftothers", "drift",
+    "undominated", "undominatedprocesses", "drothers", "dr"
+  )] <- "DR_Others"
+
+  out
+}
+
+detect_process_cols <- function(df) {
+  cn <- colnames(df)
+  cn[clean_process_name(cn) %in% process_order]
+}
+
+## Use one bin-ID convention throughout custom outputs and representative trees.
+## iCAMP BPtk/BRPtk/Ptk/Binwt use column names such as bin1, bin2, ...
+standardize_bin_id <- function(x) {
+  x <- trimws(as.character(x))
+  x <- sub("^bin", "", x, ignore.case = TRUE)
+  paste0("bin", x)
+}
+
+## ------------------------------------------------------------
+```
+
+## 4. Metadata and design QC
+
+```{r metadata-design-qc}
+meta <- read_auto(meta_file, meta_sheet)
+
+required_meta_cols <- c(
+  "SampleID", "Season", "SampleType", "Year", "Park",
+  "WorkshopAge", "Replicate", "BrewingCycle", "BrewingGroupID"
+)
+
+missing_meta_cols <- setdiff(required_meta_cols, colnames(meta))
+if (length(missing_meta_cols) > 0) {
+  stop(
+    "Metadata is missing required columns: ",
+    paste(missing_meta_cols, collapse = ", ")
+  )
+}
+
+meta <- meta %>%
+  mutate(
+    SampleID = as.character(SampleID),
+    Season = normalize_season(Season),
+    SampleType = toupper(trimws(as.character(SampleType))),
+    Year = as.character(Year),
+    Park = as.character(Park),
+    WorkshopAge = as.numeric(WorkshopAge),
+    Replicate = as.character(Replicate),
+    BrewingCycle = as.character(BrewingCycle),
+    BrewingGroupID = as.character(BrewingGroupID)
+  )
+
+if (anyDuplicated(meta$SampleID)) {
+  stop("Metadata contains duplicated SampleID values.")
+}
+
+expected_bgid <- paste(meta$BrewingCycle, meta$Season, meta$Park, sep = "_")
+bad_bgid <- meta$BrewingGroupID != expected_bgid
+
+if (any(bad_bgid, na.rm = TRUE)) {
+  write.csv(
+    meta[bad_bgid, ],
+    file.path(out_dir, "ERROR_BrewingGroupID_mismatch.csv"),
+    row.names = FALSE
+  )
+  stop("BrewingGroupID is inconsistent with BrewingCycle + Season + Park.")
+}
+
+expected_cycle <- derive_expected_brewing_cycle(meta$Year, meta$Season)
+target_stage_row <- meta$SampleType %in% target_sample_types
+
+bad_cycle <- target_stage_row & (
+  (!is.na(expected_cycle) & (is.na(meta$BrewingCycle) | meta$BrewingCycle != expected_cycle)) |
+  (is.na(expected_cycle) & meta$BrewingCycle %in% core_cycles)
+)
+
+cycle_error_file <- file.path(out_dir, "ERROR_BrewingCycle_design_mismatch.csv")
+if (file.exists(cycle_error_file)) unlink(cycle_error_file)
+
+if (any(bad_cycle, na.rm = TRUE)) {
+  cycle_bad_df <- meta[bad_cycle, , drop = FALSE]
+  cycle_bad_df$ExpectedBrewingCycle <- expected_cycle[bad_cycle]
+  write.csv(cycle_bad_df, cycle_error_file, row.names = FALSE)
+  stop(
+    "BrewingCycle is inconsistent with the fixed Year × Season study design. ",
+    "See ERROR_BrewingCycle_design_mismatch.csv."
+  )
+}
+
+park_age_map <- meta %>%
+  distinct(Park, WorkshopAge) %>%
+  arrange(Park)
+
+write_diagnostic_csv(
+  park_age_map,
+  file.path(out_dir, "QC_Park_WorkshopAge_mapping.csv")
+)
+
+if (any(table(park_age_map$Park) > 1) ||
+    any(table(park_age_map$WorkshopAge) > 1)) {
+  stop(
+    "Park and WorkshopAge are not one-to-one, which is inconsistent with the assumed study design."
+  )
+}
+
+write_diagnostic_csv(
+  meta,
+  file.path(out_dir, "metadata_raw_checked.csv")
+)
+
+message("Metadata rows before ASV matching: ", nrow(meta))
+
+## ------------------------------------------------------------
+```
+
+## 5. Read and validate the raw ASV count table
+
+```{r read-asv-table}
+if (!file.exists(asv_file)) stop("ASV count file not found: ", asv_file)
+
+asv_dt <- data.table::fread(
+  asv_file,
+  data.table = FALSE,
+  check.names = FALSE
+)
+
+if (ncol(asv_dt) < 3) {
+  stop("The ASV table has too few columns. Check the input file.")
+}
+
+first_ids <- as.character(asv_dt[[1]])
+
+asv_numeric <- as_numeric_matrix_strict(
+  asv_dt[, -1, drop = FALSE],
+  object_name = "ASV count table"
+)
+
+rownames(asv_numeric) <- first_ids
+
+if (anyDuplicated(rownames(asv_numeric))) {
+  stop("The first column of the ASV table contains duplicated identifiers.")
+}
+
+if (anyDuplicated(colnames(asv_numeric))) {
+  stop("The ASV table contains duplicated column identifiers.")
+}
+
+n_match_col <- length(intersect(colnames(asv_numeric), meta$SampleID))
+n_match_row <- length(intersect(rownames(asv_numeric), meta$SampleID))
+
+if (n_match_col == 0 && n_match_row == 0) {
+  stop("No SampleID overlap was found between the ASV table and metadata.")
+}
+
+if (n_match_col >= n_match_row) {
+  message("Detected ASV table orientation: rows = ASVs, columns = samples. Transposing.")
+  comm_all <- t(asv_numeric)
+} else {
+  message("Detected ASV table orientation: rows = samples, columns = ASVs.")
+  comm_all <- asv_numeric
+}
+
+if (anyDuplicated(rownames(comm_all))) {
+  stop("The oriented ASV matrix contains duplicated sample identifiers.")
+}
+
+if (anyDuplicated(colnames(comm_all))) {
+  stop("The oriented ASV matrix contains duplicated ASV identifiers.")
+}
+
+## ------------------------------------------------------------
+##   Cycle1 + Cycle2
+##   ×
+##   BZ + EZ
+```
+
+## 6. Match samples and define the core iCAMP regional pool
+
+```{r core-regional-pool}
+core_expected_meta <- meta %>%
+  filter(BrewingCycle %in% core_cycles, SampleType %in% target_sample_types)
+
+missing_core_meta <- core_expected_meta %>%
+  filter(!SampleID %in% rownames(comm_all))
+
+core_match_summary <- data.frame(
+  Metric = c(
+    "Core_samples_expected_from_metadata",
+    "Core_samples_present_in_ASV_table",
+    "Core_samples_missing_from_ASV_table"
+  ),
+  Value = c(
+    nrow(core_expected_meta),
+    sum(core_expected_meta$SampleID %in% rownames(comm_all)),
+    nrow(missing_core_meta)
+  )
+)
+write.csv(
+  core_match_summary,
+  file.path(out_dir, "QC_core_sample_matching_summary.csv"),
+  row.names = FALSE
+)
+
+missing_core_file <- file.path(out_dir, "QC_core_samples_missing_from_ASV_table.csv")
+if (file.exists(missing_core_file)) unlink(missing_core_file)
+if (nrow(missing_core_meta) > 0) {
+  keep_qc_cols <- intersect(
+    c("SampleID", "Year", "Season", "Park", "SampleType", "BrewingCycle", "Replicate"),
+    colnames(missing_core_meta)
+  )
+  write.csv(
+    missing_core_meta[, keep_qc_cols, drop = FALSE],
+    missing_core_file,
+    row.names = FALSE
+  )
+  warning(
+    nrow(missing_core_meta),
+    " core metadata sample(s) were not found in the ASV table. ",
+    "The analysis will continue with matched samples; inspect QC_core_samples_missing_from_ASV_table.csv."
+  )
+}
+
+## Extra ASV-table samples not represented in metadata are troubleshooting-only.
+write_diagnostic_csv(
+  data.frame(SampleID = setdiff(rownames(comm_all), meta$SampleID)),
+  file.path(out_dir, "QC_samples_in_ASV_table_not_metadata.csv")
+)
+
+common_samples <- intersect(rownames(comm_all), meta$SampleID)
+
+if (length(common_samples) < 3) {
+  stop("Fewer than three samples are shared by the ASV table and metadata.")
+}
+
+comm_all <- comm_all[common_samples, , drop = FALSE]
+meta <- meta[match(common_samples, meta$SampleID), , drop = FALSE]
+stopifnot(all(rownames(comm_all) == meta$SampleID))
+
+core_keep <- !is.na(meta$BrewingCycle) & !is.na(meta$SampleType) &
+  meta$BrewingCycle %in% core_cycles &
+  meta$SampleType %in% target_sample_types
+
+write_diagnostic_csv(
+  meta[!core_keep, , drop = FALSE],
+  file.path(out_dir, "QC_samples_excluded_from_core_iCAMP_pool.csv")
+)
+
+meta <- meta[core_keep, , drop = FALSE]
+comm_core_raw <- comm_all[meta$SampleID, , drop = FALSE]
+
+## Invariant for this public BZ/EZ-only workflow.
+if (!all(as.character(meta$SampleType) %in% target_sample_types)) {
+  stop("Non-target SampleType values remain after core-sample filtering.")
+}
+
+## Core design fields must be complete before downstream grouping/inference.
+core_design_cols <- c(
+  "SampleID", "Season", "SampleType", "Park", "WorkshopAge",
+  "BrewingCycle", "BrewingGroupID"
+)
+if (anyNA(meta[, core_design_cols, drop = FALSE])) {
+  stop("Core iCAMP metadata contains missing design values.")
+}
+if (any(!meta$Season %in% season_levels)) {
+  stop("Core iCAMP metadata contains unrecognized Season values.")
+}
+
+## Remove only ASVs that are absent from every core sample.
+comm_core_raw <- comm_core_raw[
+  ,
+  colSums(comm_core_raw) > 0,
+  drop = FALSE
+]
+
+zero_core_samples <- rownames(comm_core_raw)[rowSums(comm_core_raw) <= 0]
+if (length(zero_core_samples) > 0) {
+  write.csv(
+    data.frame(SampleID = zero_core_samples),
+    file.path(out_dir, "ERROR_zero_library_core_samples.csv"),
+    row.names = FALSE
+  )
+  stop(
+    "At least one core sample has zero total ASV counts. See ERROR_zero_library_core_samples.csv."
+  )
+}
+
+meta <- meta %>%
+  mutate(
+    Season = factor(Season, levels = season_levels),
+    BrewingCycle = factor(BrewingCycle, levels = core_cycles),
+    SampleType = factor(SampleType, levels = target_sample_types),
+    Park = factor(Park),
+    Season_SampleType = paste(Season, SampleType, sep = "_"),
+    Cycle_SampleType = paste(BrewingCycle, SampleType, sep = "_"),
+    Cycle_Season_SampleType = paste(BrewingCycle, Season, SampleType, sep = "_"),
+    Season_SampleType_Park = paste(Season, SampleType, Park, sep = "_"),
+    Cycle_Season_SampleType_Park = paste(BrewingCycle, Season, SampleType, Park, sep = "_"),
+    Context_SampleType = paste(BrewingGroupID, SampleType, sep = "_")
+  )
+
+write_diagnostic_csv(
+  meta,
+  file.path(out_dir, "metadata_core_iCAMP.csv")
+)
+
+write_diagnostic_csv(
+  meta %>%
+    count(BrewingCycle, Season, Park, SampleType, name = "N"),
+  file.path(out_dir, "QC_core_design_counts_Cycle_Season_Park_SampleType.csv")
+)
+
+write_diagnostic_csv(
+  data.frame(
+    SampleID = rownames(comm_core_raw),
+    CoreLibrarySize = rowSums(comm_core_raw)
+  ),
+  file.path(out_dir, "QC_core_raw_library_sizes.csv")
+)
+
+message("Core iCAMP samples: ", nrow(comm_core_raw))
+message("ASVs observed in at least one core sample before tree matching: ", ncol(comm_core_raw))
+
+## ------------------------------------------------------------
+##   intersect(colnames(comm_core_raw), tree_input$tip.label)
+```
+
+## 7. Match the core ASV community to the phylogenetic tree
+
+```{r phylogenetic-tree-matching}
+tree_input <- ape::read.tree(tree_file)
+
+if (!inherits(tree_input, "phylo")) {
+  stop("tree.nwk must contain exactly one phylogenetic tree.")
+}
+if (is.null(tree_input$tip.label)) {
+  stop("The phylogenetic tree contains no tip labels.")
+}
+if (is.null(tree_input$edge.length) || any(!is.finite(tree_input$edge.length)) || any(tree_input$edge.length < 0)) {
+  stop("The phylogenetic tree must contain finite, non-negative branch lengths for iCAMP.")
+}
+
+if (anyDuplicated(tree_input$tip.label)) {
+  stop("The phylogenetic tree contains duplicated ASV tip labels.")
+}
+
+core_asvs <- colnames(comm_core_raw)
+common_asvs <- core_asvs[core_asvs %in% tree_input$tip.label]
+
+if (length(common_asvs) < 2L || nrow(comm_core_raw) < 3L) {
+  stop("Tree-matched analysis requires at least two ASVs and three core samples.")
+}
+if (length(common_asvs) < 50) {
+  warning(
+    "Fewer than 50 ASVs are shared by the core community and phylogenetic tree. ",
+    "Check ASV identifiers and tree construction before interpreting iCAMP."
+  )
+}
+
+write_diagnostic_csv(
+  data.frame(ASV = setdiff(core_asvs, tree_input$tip.label)),
+  file.path(out_dir, "QC_ASVs_in_core_community_not_in_tree.csv")
+)
+write_diagnostic_csv(
+  data.frame(ASV = setdiff(tree_input$tip.label, core_asvs)),
+  file.path(out_dir, "QC_ASVs_in_tree_not_observed_in_core_community.csv")
+)
+
+comm <- comm_core_raw[, common_asvs, drop = FALSE]
+tree <- ape::keep.tip(tree_input, common_asvs)
+
+zero_tree_matched_samples <- rownames(comm)[rowSums(comm) <= 0]
+if (length(zero_tree_matched_samples) > 0) {
+  write.csv(
+    data.frame(SampleID = zero_tree_matched_samples),
+    file.path(out_dir, "ERROR_zero_tree_matched_library_samples.csv"),
+    row.names = FALSE
+  )
+  stop(
+    "At least one core sample has zero counts after phylogenetic-tree matching. ",
+    "The tree does not adequately represent all core samples."
+  )
+}
+
+tree_matched_abundance <- sum(comm)
+core_total_abundance <- sum(comm_core_raw)
+
+per_sample_tree_coverage <- rowSums(comm) / rowSums(comm_core_raw)
+
+coverage_summary <- data.frame(
+  Metric = c(
+    "Core_samples",
+    "Core_ASVs_observed_before_tree_matching",
+    "Phylogenetic_tree_tips",
+    "Core_ASVs_matched_to_tree",
+    "Fraction_of_core_ASVs_matched_to_tree",
+    "Fraction_of_tree_tips_observed_in_core_community",
+    "Tree_matched_abundance_fraction_of_core_community",
+    "Per_sample_tree_coverage_min",
+    "Per_sample_tree_coverage_median",
+    "Per_sample_tree_coverage_mean"
+  ),
+  Value = c(
+    nrow(comm_core_raw),
+    ncol(comm_core_raw),
+    length(tree_input$tip.label),
+    length(common_asvs),
+    length(common_asvs) / max(1, ncol(comm_core_raw)),
+    length(common_asvs) / max(1, length(tree_input$tip.label)),
+    tree_matched_abundance / max(1, core_total_abundance),
+    min(per_sample_tree_coverage),
+    median(per_sample_tree_coverage),
+    mean(per_sample_tree_coverage)
+  )
+)
+
+write.csv(
+  coverage_summary,
+  file.path(out_dir, "QC_tree_matching_coverage_summary.csv"),
+  row.names = FALSE
+)
+
+per_sample_cov_df <- meta %>%
+  select(SampleID, BrewingCycle, Season, Park, SampleType) %>%
+  mutate(
+    CoreLibrarySize = rowSums(comm_core_raw)[SampleID],
+    TreeMatchedLibrarySize = rowSums(comm)[SampleID],
+    TreeMatchedAbundanceCoverage = per_sample_tree_coverage[SampleID]
+  )
+
+write_diagnostic_csv(
+  per_sample_cov_df,
+  file.path(out_dir, "QC_tree_matching_coverage_per_sample.csv")
+)
+
+stage_coverage <- per_sample_cov_df %>%
+  group_by(SampleType) %>%
+  summarise(
+    NSamples = n(),
+    SumCoreReads = sum(CoreLibrarySize),
+    SumTreeMatchedReads = sum(TreeMatchedLibrarySize),
+    AbundanceCoverage = SumTreeMatchedReads / SumCoreReads,
+    MinSampleCoverage = min(TreeMatchedAbundanceCoverage),
+    MedianSampleCoverage = median(TreeMatchedAbundanceCoverage),
+    MeanSampleCoverage = mean(TreeMatchedAbundanceCoverage),
+    .groups = "drop"
+  )
+
+write.csv(
+  stage_coverage,
+  file.path(out_dir, "QC_tree_matching_coverage_by_SampleType.csv"),
+  row.names = FALSE
+)
+
+if ((tree_matched_abundance / max(1, core_total_abundance)) <
+    tree_abundance_coverage_warning) {
+  warning(
+    "Tree-matched ASVs account for less than ",
+    tree_abundance_coverage_warning * 100,
+    "% of total core-community reads. Interpret iCAMP as the assembly of the ",
+    "phylogenetically represented community and inspect coverage QC files."
+  )
+}
+
+if (min(per_sample_tree_coverage) < per_sample_tree_coverage_warning) {
+  warning(
+    "At least one sample has tree-matched abundance coverage below ",
+    per_sample_tree_coverage_warning * 100,
+    "%. Inspect QC_tree_matching_coverage_per_sample.csv."
+  )
+}
+
+## Record prevalence for QC only; do not filter the primary ASV pool.
+asv_prev_qc <- data.frame(
+  ASV = colnames(comm),
+  PrevalenceN_Core = colSums(comm > 0),
+  PrevalenceFraction_Core = colMeans(comm > 0),
+  TotalAbundance_Core = colSums(comm),
+  stringsAsFactors = FALSE
+)
+
+for (stype in target_sample_types) {
+  ids <- meta$SampleID[as.character(meta$SampleType) == stype]
+  asv_prev_qc[[paste0("PrevalenceN_", stype)]] <- colSums(comm[ids, , drop = FALSE] > 0)
+  asv_prev_qc[[paste0("PrevalenceFraction_", stype)]] <- colMeans(comm[ids, , drop = FALSE] > 0)
+}
+
+write_diagnostic_csv(
+  asv_prev_qc,
+  file.path(out_dir, "QC_tree_matched_ASV_prevalence_distribution.csv")
+)
+
+prevalence_threshold_summary <- data.frame(
+  Criterion = c(
+    "Detected_in_at_least_1_core_sample",
+    "Detected_in_at_least_3_core_samples",
+    "Detected_in_at_least_9_core_samples",
+    "Core_prevalence_at_least_10_percent"
+  ),
+  NASVs = c(
+    sum(asv_prev_qc$PrevalenceN_Core >= 1),
+    sum(asv_prev_qc$PrevalenceN_Core >= 3),
+    sum(asv_prev_qc$PrevalenceN_Core >= 9),
+    sum(asv_prev_qc$PrevalenceFraction_Core >= 0.10)
+  )
+)
+
+if (isTRUE(save_diagnostics) || isTRUE(run_prevalence_sensitivity)) {
+  write.csv(
+    prevalence_threshold_summary,
+    file.path(out_dir, "QC_tree_matched_ASV_prevalence_threshold_counts.csv"),
+    row.names = FALSE
+  )
+}
+
+if (!ape::is.rooted(tree)) {
+  message("The phylogenetic tree is not rooted.")
+  if (requireNamespace("phangorn", quietly = TRUE)) {
+    message("Applying phangorn::midpoint() rooting for a reproducible rooted tree.")
+    tree <- phangorn::midpoint(tree)
+  } else {
+    warning(
+      "Package 'phangorn' is unavailable. The unrooted tree will be passed to icamp.big(), ",
+      "which performs its own midpoint rooting internally."
+    )
+  }
+}
+
+## Final strict alignment
+tree <- ape::keep.tip(tree, colnames(comm))
+comm <- comm[, tree$tip.label, drop = FALSE]
+meta <- meta[match(rownames(comm), meta$SampleID), , drop = FALSE]
+
+stopifnot(all(rownames(comm) == meta$SampleID))
+stopifnot(setequal(colnames(comm), tree$tip.label))
+
+if (isTRUE(save_diagnostics)) {
+  write.csv(
+    comm,
+    file.path(out_dir, "comm_final_iCAMP_tree_matched_ASVs_samples_by_ASV.csv")
+  )
+}
+
+if (isTRUE(save_diagnostics)) {
+  ape::write.tree(
+    tree,
+    file.path(out_dir, "tree_final_iCAMP_tree_matched_ASVs.nwk")
+  )
+}
+
+write_diagnostic_csv(
+  meta,
+  file.path(out_dir, "metadata_final_iCAMP.csv")
+)
+
+parameter_manifest <- data.frame(
+  Parameter = c(
+    "Primary_ASV_filtering",
+    "Primary_ASV_pool",
+    "Core_sample_matching_QC",
+    "BrewingCycle_QC",
+    "Taxonomy_coverage_warning",
+    "Core_cycles",
+    "Target_sample_types",
+    "Randomizations",
+    "Phylogenetic_metric",
+    "Significance_index",
+    "Bin_size_limit",
+    "Phylogenetic_randomization_scale",
+    "Taxonomic_randomization_scale",
+    "Taxonomic_dissimilarity",
+    "unit.sum",
+    "save_diagnostics",
+    "Bin_level_analysis",
+    "iCAMP_native_file_saving"
+  ),
+  Value = c(
+    "No prevalence filter; observed in >=1 core sample and matched to phylogenetic tree",
+    "Common tree-matched ASV pool shared by BZ and EZ",
+    "Always summarize expected/matched/missing core samples; missing core samples trigger warning + detail file",
+    "Strict fixed Year × Season mapping for BZ/EZ core stages",
+    taxonomy_coverage_warning,
+    paste(core_cycles, collapse = ";"),
+    paste(target_sample_types, collapse = ";"),
+    rand_time,
+    phylo_metric,
+    sig_index,
+    bin_size_limit,
+    "within.bin",
+    "across.all",
+    "Bray-Curtis",
+    "rowSums(tree-matched ASV community)",
+    save_diagnostics,
+    "Always run",
+    "rtree.save=FALSE; qp.save=FALSE; detail.save=TRUE (required for icamp.bins)"
+  )
+)
+
+write.csv(
+  parameter_manifest,
+  file.path(out_dir, "00_analysis_parameter_manifest.csv"),
+  row.names = FALSE
+)
+
+message("Final samples used for primary iCAMP: ", nrow(comm))
+message("Final tree-matched ASVs used for primary iCAMP: ", ncol(comm))
+```
+
+## 8. Optional taxonomy
+
+```{r taxonomy}
+taxonomy <- NULL
+
+if (file.exists(tax_file)) {
+  tax_dt <- data.table::fread(
+    tax_file,
+    data.table = FALSE,
+    check.names = FALSE
+  )
+
+  if (ncol(tax_dt) < 2) {
+    stop("taxonomy.tsv has too few columns.")
+  }
+
+  tax_df <- tax_dt[, -1, drop = FALSE]
+  rownames(tax_df) <- as.character(tax_dt[[1]])
+
+  if (anyDuplicated(rownames(tax_df))) {
+    stop("The taxonomy table contains duplicated ASV identifiers.")
+  }
+
+  common_tax_for_tax <- colnames(comm)[colnames(comm) %in% rownames(tax_df)]
+  missing_tax_asvs <- setdiff(colnames(comm), rownames(tax_df))
+  taxonomy_coverage <- length(common_tax_for_tax) / max(1, ncol(comm))
+
+  taxonomy_qc <- data.frame(
+    Metric = c(
+      "Final_iCAMP_ASVs",
+      "Taxonomy_rows",
+      "Taxonomy_ASVs_matched_to_final_iCAMP",
+      "Final_iCAMP_ASVs_without_taxonomy",
+      "Taxonomy_coverage_fraction"
+    ),
+    Value = c(
+      ncol(comm),
+      nrow(tax_df),
+      length(common_tax_for_tax),
+      length(missing_tax_asvs),
+      taxonomy_coverage
+    )
+  )
+  write.csv(
+    taxonomy_qc,
+    file.path(out_dir, "QC_taxonomy_matching_summary.csv"),
+    row.names = FALSE
+  )
+
+  missing_tax_file <- file.path(out_dir, "QC_iCAMP_ASVs_without_taxonomy.csv")
+  if (file.exists(missing_tax_file)) unlink(missing_tax_file)
+  if (length(missing_tax_asvs) > 0) {
+    write.csv(
+      data.frame(ASV = missing_tax_asvs),
+      missing_tax_file,
+      row.names = FALSE
+    )
+  }
+
+  if (length(common_tax_for_tax) == 0) {
+    warning(
+      "taxonomy.tsv was found, but no taxonomy ASV IDs matched the final iCAMP ASVs. ",
+      "Bin taxonomy annotation will be skipped."
+    )
+    taxonomy <- NULL
+  } else {
+    taxonomy <- tax_df[common_tax_for_tax, , drop = FALSE]
+    write_diagnostic_csv(
+      taxonomy,
+      file.path(out_dir, "taxonomy_tree_matched_ASVs.csv"),
+      row_names = TRUE
+    )
+    message(
+      "Taxonomy matched to ", nrow(taxonomy), " / ", ncol(comm),
+      " final ASVs (", round(taxonomy_coverage * 100, 2), "%)."
+    )
+
+    if (taxonomy_coverage < taxonomy_coverage_warning) {
+      warning(
+        "Taxonomy coverage is below ", taxonomy_coverage_warning * 100,
+        "% of final iCAMP ASVs. Bin.TopClass remains optional annotation and should be interpreted cautiously."
+      )
+    }
+  }
+} else {
+  message("taxonomy.tsv was not found. Taxonomy-dependent bin annotations will be skipped.")
+}
+```
+
+## 9. Group-size QC
+
+```{r group-size-qc}
+check_group_size <- function(meta, group_col) {
+  tab <- table(meta[[group_col]])
+  tab_df <- data.frame(Group = names(tab), N = as.numeric(tab))
+
+  write_diagnostic_csv(
+    tab_df,
+    file.path(out_dir, paste0("group_size_", group_col, ".csv"))
+  )
+
+  message("Sample counts for grouping ", group_col, ":")
+  print(tab_df)
+
+  if (any(tab_df$N < 2)) {
+    warning(group_col, " contains groups with N < 2; within-group turnover cannot be summarized.")
+  }
+
+  if (any(tab_df$N < 3)) {
+    warning(group_col, " contains groups with N < 3; bootstrap stability may be limited.")
+  }
+}
+
+for (gc in group_cols_to_boot) {
+  if (gc %in% colnames(meta)) check_group_size(meta, gc)
+}
+
+check_group_size(meta, "Context_SampleType")
+```
+
+## 10. Primary-analysis ASV universe summary
+
+Record the number of ASVs before tree matching, in the tree, and in the final iCAMP intersection.
+
+```{r asv-universe-summary}
+primary_asv_summary <- data.frame(
+  Stage = c(
+    "Core ASV table before tree matching",
+    "Phylogenetic tree",
+    "Primary iCAMP intersection"
+  ),
+  NASVs = c(
+    ncol(comm_core_raw),
+    length(tree_input$tip.label),
+    ncol(comm)
+  )
+)
+
+write_diagnostic_csv(
+  primary_asv_summary,
+  file.path(out_dir, "QC_primary_ASV_universe_summary.csv")
+)
+
+
+## ------------------------------------------------------------
+```
+
+## 11. Main iCAMP analysis
+
+```{r main-icamp}
+set.seed(seed_main)
+
+message("Running the primary icamp.big() analysis using all core-sample ASVs matched to the phylogenetic tree.")
+
+icamp_res <- icamp.big(
+  comm = comm,
+  tree = tree,
+  pd.wd = pd_dir,
+  rand = rand_time,
+  prefix = paste0("iCAMP_core_treeMatchedAllASV_bin", bin_size_limit),
+  ds = 0.2,
+  pd.cut = NA,
+  sp.check = TRUE,
+  phylo.rand.scale = "within.bin",
+  taxa.rand.scale = "across.all",
+  phylo.metric = phylo_metric,
+  sig.index = sig_index,
+  bin.size.limit = bin_size_limit,
+  nworker = nworker,
+  memory.G = memory_G,
+  rtree.save = FALSE,
+  detail.save = TRUE,
+  qp.save = FALSE,
+  detail.null = FALSE,
+  ignore.zero = TRUE,
+  output.wd = out_dir,
+  unit.sum = rowSums(comm),
+  correct.special = TRUE,
+  ses.cut = 1.96,
+  rc.cut = 0.95,
+  conf.cut = 0.975
+)
+
+saveRDS(icamp_res, file.path(out_dir, "icamp_res_core.rds"))
+
+message("Primary icamp.big() analysis completed.")
+```
+
+## 12. Extract community-level process contribution matrix
+
+Identify and standardize the community-level five-process contribution table returned by iCAMP.
+
+```{r community-process-table}
+## Identify the community-level result table returned by icamp.big().
+find_icamp_process_table <- function(icamp_res) {
+  ## With the current fixed settings (bMPD + SES.RC + within.bin + across.all),
+  ## icamp.big() returns the community-level process table as bNRIiRCa.
+  ## Prefer this explicit object; retain a small fallback for version compatibility.
+  preferred <- "bNRIiRCa"
+  candidate_names <- c(preferred, setdiff(names(icamp_res), preferred))
+  
+  for (nm in candidate_names) {
+    if (!nm %in% names(icamp_res)) next
+    x <- icamp_res[[nm]]
+    if (!(is.matrix(x) || is.data.frame(x))) next
+    
+    df <- as.data.frame(x, check.names = FALSE)
+    if (ncol(df) < 7) next
+    
+    proc_cols <- detect_process_cols(df)
+    if (length(proc_cols) == length(process_order)) {
+      message("Detected community-level iCAMP result object: ", nm)
+      return(list(name = nm, table = df))
+    }
+  }
+  
+  stop(
+    "Unable to identify the five-process community-level iCAMP table. ",
+    "Expected columns equivalent to HeS, HoS, DL, HD and DR_Others."
+  )
+}
+
+proc_obj <- find_icamp_process_table(icamp_res)
+process_name <- proc_obj$name
+process_table <- proc_obj$table
+
+## Standardize the first two columns as sample-pair identifiers.
+colnames(process_table)[1:2] <- c("Sample1", "Sample2")
+
+write_diagnostic_csv(
+  process_table,
+  file.path(out_dir, paste0("iCAMP_community_process_table_", process_name, ".csv"))
+)
+
+message("Community-level result table detected: ", process_name)
+```
+
+## 13. Bootstrap summaries by SampleType and brewing-season groupings
+
+Generate bootstrap summaries for the overall BZ/EZ SampleType comparison.
+
+```{r bootstrap-summaries}
+run_icamp_boot_one_group <- function(group_col, process_table, meta, out_dir) {
+  if (!group_col %in% colnames(meta)) {
+    warning("Grouping column is absent from metadata: ", group_col)
+    return(NULL)
+  }
+  
+  treat <- data.frame(Group = meta[[group_col]])
+  rownames(treat) <- meta$SampleID
+  
+  ## Groups with fewer than two samples cannot contribute within-group turnover pairs.
+  tab <- table(treat$Group)
+  keep_groups <- names(tab)[tab >= 2]
+  treat <- treat[treat$Group %in% keep_groups, , drop = FALSE]
+  
+  if (length(unique(treat$Group)) < 1) {
+    warning(group_col, " has no groups eligible for within-group analysis.")
+    return(NULL)
+  }
+  
+  bt <- icamp.boot(
+    icamp.result = process_table,
+    treat = treat,
+    rand.time = rand_time,
+    compare = TRUE,
+    silent = FALSE,
+    between.group = TRUE,
+    ST.estimation = TRUE
+  )
+  
+  if (!is.null(bt$summary)) {
+    write.csv(
+      bt$summary,
+      file.path(out_dir, paste0("icamp_boot_summary_", group_col, ".csv")),
+      row.names = FALSE
+    )
+  }
+  
+  if (!is.null(bt$compare) && isTRUE(save_diagnostics)) {
+    write.csv(
+      bt$compare,
+      file.path(out_dir, paste0("icamp_boot_compare_", group_col, ".csv")),
+      row.names = FALSE
+    )
+  }
+  
+  return(bt)
+}
+
+boot_list <- list()
+
+for (gc in group_cols_to_boot) {
+  message("Running bootstrap summary for grouping: ", gc)
+  boot_list[[gc]] <- run_icamp_boot_one_group(gc, process_table, meta, out_dir)
+}
+
+if (isTRUE(save_diagnostics)) {
+  saveRDS(boot_list, file.path(out_dir, "icamp_boot_all_groups.rds"))
+}
+```
+
+## 14. Plot community-level assembly-process profiles
+
+Create the community-level stacked assembly-process profile figure.
+
+```{r community-process-plots}
+plot_icamp_boot_bar <- function(boot_obj, group_col, out_dir) {
+  if (is.null(boot_obj)) return(NULL)
+  if (is.null(boot_obj$summary)) return(NULL)
+  
+  df <- as.data.frame(boot_obj$summary)
+  
+  if (!all(c("Group", "Process", "Observed") %in% colnames(df))) {
+    warning("Bootstrap summary lacks Group / Process / Observed columns; plotting skipped for: ", group_col)
+    return(NULL)
+  }
+  
+  df$Process <- clean_process_name(df$Process)
+  df <- df[df$Process %in% process_order, , drop = FALSE]
+  if (identical(group_col, "SampleType")) {
+    df <- df[df$Group %in% target_sample_types, , drop = FALSE]
+  }
+  if (nrow(df) == 0) {
+    warning("No standard five-process rows were found for plotting: ", group_col)
+    return(NULL)
+  }
+  df$Process <- factor(df$Process, levels = process_order)
+  
+  p <- ggplot(df, aes(x = Group, y = Observed, fill = Process)) +
+    geom_col(width = 0.75) +
+    theme_bw(base_size = 12) +
+    labs(
+      x = group_col,
+      y = "Relative importance",
+      fill = "Process",
+      title = paste("iCAMP community assembly processes by", group_col)
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid.major.x = element_blank(),
+      plot.title = element_text(hjust = 0.5)
+    )
+  
+  ggsave(
+    filename = file.path(out_dir, paste0("Plot_iCAMP_bar_", group_col, ".pdf")),
+    plot = p,
+    width = 8,
+    height = 5
+  )
+  
+  if (isTRUE(save_png)) {
+    ggsave(
+      filename = file.path(out_dir, paste0("Plot_iCAMP_bar_", group_col, ".png")),
+      plot = p,
+      width = 8,
+      height = 5,
+      dpi = 300
+    )
+  }
+  
+  return(p)
+}
+
+for (gc in names(boot_list)) {
+  plot_icamp_boot_bar(boot_list[[gc]], gc, out_dir)
+}
+
+
+## ------------------------------------------------------------
+## Context_SampleType =
+##   BrewingCycle × Season × Park × SampleType
+```
+
+## 14B. Context-level assembly-process summaries and inference
+```{r context-level-inference}
+## Context_SampleType = BrewingCycle × Season × Park × SampleType
+
+## Standardize sample-pair columns for compatibility across iCAMP versions.
+process_table_std <- process_table
+colnames(process_table_std)[1:2] <- c("Sample1", "Sample2")
+
+## Standardize the five mutually exclusive ecological-process columns.
+proc_cols0 <- detect_process_cols(process_table_std)
+if (length(proc_cols0) != length(process_order)) {
+  stop(
+    "Expected five iCAMP process columns (HeS, HoS, DL, HD, DR_Others), but detected: ",
+    paste(proc_cols0, collapse = ", ")
+  )
+}
+
+mapped0 <- clean_process_name(proc_cols0)
+if (anyDuplicated(mapped0) || !setequal(mapped0, process_order)) {
+  stop("The detected iCAMP process columns could not be uniquely standardized to the five processes.")
+}
+
+names(process_table_std)[match(proc_cols0, names(process_table_std))] <- mapped0
+process_cols_std <- process_order
+
+process_sum <- rowSums(process_table_std[, process_cols_std, drop = FALSE])
+if (any(!is.finite(process_sum))) {
+  stop("Non-finite values were found in the five iCAMP process contributions.")
+}
+if (max(abs(process_sum - 1)) > 1e-5) {
+  warning("The five iCAMP process contributions do not sum to 1 for at least one sample pair.")
+}
+
+if (length(process_cols_std) == length(process_order)) {
+  msmall <- meta %>%
+    select(SampleID, Year, BrewingCycle, Season, Park, WorkshopAge, SampleType, BrewingGroupID, Context_SampleType)
+
+  m1 <- msmall; names(m1) <- paste0("S1_", names(m1))
+  m2 <- msmall; names(m2) <- paste0("S2_", names(m2))
+
+  pair_meta <- process_table_std %>%
+    left_join(m1, by = c("Sample1" = "S1_SampleID")) %>%
+    left_join(m2, by = c("Sample2" = "S2_SampleID"))
+
+  context_pairs <- pair_meta %>%
+    filter(!is.na(S1_Context_SampleType), S1_Context_SampleType == S2_Context_SampleType)
+
+  write_diagnostic_csv(context_pairs, file.path(out_dir, "context_within_pair_process_contributions.csv"))
+
+  if (nrow(context_pairs) > 0) {
+    context_long <- context_pairs %>%
+      select(
+        Context_SampleType = S1_Context_SampleType,
+        BrewingGroupID = S1_BrewingGroupID,
+        BrewingCycle = S1_BrewingCycle,
+        Season = S1_Season,
+        Park = S1_Park,
+        WorkshopAge = S1_WorkshopAge,
+        SampleType = S1_SampleType,
+        all_of(process_cols_std)
+      ) %>%
+      pivot_longer(cols = all_of(process_cols_std), names_to = "Process", values_to = "Contribution") %>%
+      mutate(Contribution = as.numeric(Contribution), Process = clean_process_name(Process))
+
+    context_summary <- context_long %>%
+      group_by(Context_SampleType, BrewingGroupID, BrewingCycle, Season, Park, WorkshopAge, SampleType, Process) %>%
+      summarise(
+        N_pairs = n(),
+        MeanContribution = mean(Contribution, na.rm = TRUE),
+        SDContribution = sd(Contribution, na.rm = TRUE),
+        MedianContribution = median(Contribution, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    write.csv(context_summary, file.path(out_dir, "context_level_assembly_processes.csv"), row.names = FALSE)
+
+    season_context_summary <- context_summary %>%
+      group_by(Season, SampleType, Process) %>%
+      summarise(
+        N_context = n(),
+        Mean = mean(MeanContribution, na.rm = TRUE),
+        SD = sd(MeanContribution, na.rm = TRUE),
+        Median = median(MeanContribution, na.rm = TRUE),
+        .groups = "drop"
+      )
+    write.csv(season_context_summary, file.path(out_dir, "context_level_Season_SampleType_summary.csv"), row.names = FALSE)
+
+    p_context <- season_context_summary %>%
+      mutate(Season = factor(Season, levels = season_levels), Process = factor(Process, levels = process_order)) %>%
+      ggplot(aes(x = Season, y = Mean, fill = Process)) +
+      geom_col(width = 0.75) +
+      facet_wrap(~ SampleType, nrow = 1) +
+      labs(
+        x = "Brewing season", y = "Mean relative importance across contexts", fill = "Process",
+        title = "Context-level assembly processes across brewing seasons",
+        subtitle = "Context = BrewingCycle × Season × Park × SampleType"
+      ) +
+      theme_bw(base_size = 11) +
+      theme(panel.grid.major.x = element_blank())
+    ggsave(file.path(out_dir, "Plot_context_level_Season_by_SampleType.pdf"), p_context, width = 12, height = 5)
+    if (isTRUE(save_png)) {
+      ggsave(file.path(out_dir, "Plot_context_level_Season_by_SampleType.png"), p_context, width = 12, height = 5, dpi = 300)
+    }
+
+    ## Permutation test for the Season effect: Contribution ~ BrewingCycle + Park + Season.
+    ## Season labels are permuted within BrewingCycle × Park blocks.
+    context_season_perm_test <- function(dat, nperm = 9999, seed = 1) {
+      d <- dat[is.finite(dat$MeanContribution), , drop = FALSE]
+      d$Season <- factor(d$Season, levels = season_levels)
+      d$BrewingCycle <- factor(d$BrewingCycle, levels = core_cycles)
+      d$Park <- factor(d$Park)
+      if (nrow(d) < 8 || nlevels(droplevels(d$Season)) < 2) {
+        return(data.frame(F = NA_real_, P = NA_real_, N_context = nrow(d)))
+      }
+      ## Drop constant nuisance factors when a context subset is incomplete.
+      covariates <- c("BrewingCycle", "Park")
+      covariates <- covariates[vapply(covariates, function(v) {
+        length(unique(d[[v]])) > 1L
+      }, logical(1))]
+      model_formula <- reformulate(c(covariates, "Season"), response = "MeanContribution")
+      fit <- lm(model_formula, data = d)
+      if (df.residual(fit) <= 0L || fit$rank < ncol(model.matrix(fit))) {
+        return(data.frame(F = NA_real_, P = NA_real_, N_context = nrow(d)))
+      }
+      aa <- anova(fit)
+      if (!"Season" %in% rownames(aa)) return(data.frame(F = NA_real_, P = NA_real_, N_context = nrow(d)))
+      obsF <- aa["Season", "F value"]
+      if (!is.finite(obsF)) {
+        return(data.frame(F = NA_real_, P = NA_real_, N_context = nrow(d)))
+      }
+      block <- interaction(d$BrewingCycle, d$Park, drop = TRUE)
+      set.seed(seed)
+      permF <- rep(NA_real_, nperm)
+      for (b in seq_len(nperm)) {
+        dp <- d
+        dp$Season <- ave(as.character(dp$Season), block, FUN = function(x) sample(x, length(x), replace = FALSE))
+        dp$Season <- factor(dp$Season, levels = season_levels)
+        ap <- anova(lm(model_formula, data = dp))
+        if ("Season" %in% rownames(ap)) permF[b] <- ap["Season", "F value"]
+      }
+      valid <- is.finite(permF)
+      if (!any(valid)) {
+        return(data.frame(F = as.numeric(obsF), P = NA_real_, N_context = nrow(d)))
+      }
+      data.frame(F = as.numeric(obsF), P = (sum(permF[valid] >= obsF) + 1) / (sum(valid) + 1), N_context = nrow(d))
+    }
+
+    test_list <- list(); kk <- 1
+    for (stype in target_sample_types) {
+      for (proc in process_order) {
+        dd <- context_summary %>% filter(as.character(SampleType) == stype, Process == proc)
+        if (nrow(dd) == 0) next
+        tt <- context_season_perm_test(dd, nperm = context_nperm, seed = seed_main + 500 + kk)
+        test_list[[kk]] <- cbind(data.frame(SampleType = stype, Process = proc), tt)
+        kk <- kk + 1
+      }
+    }
+    context_tests <- bind_rows(test_list) %>%
+      group_by(SampleType) %>% mutate(P_BH = p.adjust(P, method = "BH")) %>% ungroup()
+    write.csv(context_tests, file.path(out_dir, "context_level_Season_effect_permutation_tests.csv"), row.names = FALSE)
+
+    ## Cross-cycle reproducibility of the five-process profile within Season × SampleType.
+    cycle_profiles <- context_summary %>%
+      group_by(BrewingCycle, Season, SampleType, Process) %>%
+      summarise(N_context = n(), MeanContribution = mean(MeanContribution, na.rm = TRUE), .groups = "drop")
+    write_diagnostic_csv(cycle_profiles, file.path(out_dir, "cross_cycle_process_profiles.csv"))
+
+    cycle_sim <- list(); kk <- 1
+    for (stype in target_sample_types) {
+      for (ss in season_levels) {
+        dd <- cycle_profiles %>%
+          filter(as.character(SampleType) == stype, as.character(Season) == ss) %>%
+          select(BrewingCycle, Process, MeanContribution) %>%
+          pivot_wider(names_from = BrewingCycle, values_from = MeanContribution)
+        n_process <- if (all(core_cycles %in% names(dd))) {
+          sum(complete.cases(dd[, core_cycles, drop = FALSE]))
+        } else {
+          0
+        }
+        if (n_process == length(process_order)) {
+          rho <- suppressWarnings(cor(dd[[core_cycles[1]]], dd[[core_cycles[2]]], method = "spearman"))
+          madiff <- mean(abs(dd[[core_cycles[1]]] - dd[[core_cycles[2]]]))
+          cycle_sim[[kk]] <- data.frame(
+            SampleType = stype,
+            Season = ss,
+            N_process = n_process,
+            Spearman_ProcessProfile = rho,
+            MeanAbsoluteProcessDifference = madiff
+          )
+          kk <- kk + 1
+        }
+      }
+    }
+    write.csv(bind_rows(cycle_sim), file.path(out_dir, "cross_cycle_reproducibility_by_Season_SampleType.csv"), row.names = FALSE)
+
+    ## Descriptive consistency across the Park/WorkshopAge composite backgrounds.
+    park_consistency <- context_summary %>%
+      group_by(BrewingCycle, Season, SampleType, Process) %>%
+      summarise(
+        N_park_context = n_distinct(Park),
+        MeanAcrossParks = mean(MeanContribution, na.rm = TRUE),
+        SDAcrossParks = ifelse(N_park_context >= 2, sd(MeanContribution, na.rm = TRUE), NA_real_),
+        CVAcrossParks = ifelse(
+          N_park_context >= 2 & abs(MeanAcrossParks) > 1e-12,
+          SDAcrossParks / abs(MeanAcrossParks),
+          NA_real_
+        ),
+        RangeAcrossParks = ifelse(
+          N_park_context >= 2,
+          diff(range(MeanContribution, na.rm = TRUE)),
+          NA_real_
+        ),
+        .groups = "drop"
+      ) %>%
+      mutate(FullParkCoverage = N_park_context == nlevels(meta$Park))
+    write.csv(park_consistency, file.path(out_dir, "cross_park_context_process_consistency.csv"), row.names = FALSE)
+  }
+} else {
+  stop("Context-level analysis requires all five standard iCAMP process columns.")
+}
+```
+
+## 15. Bin-level analysis (always run)
+
+Run `icamp.bins()` and retain the primary bin-level outputs required for downstream interpretation.
+
+```{r bin-level-analysis}
+message("Running icamp.bins() for bin-level results.")
+
+## Keep only grouping schemes needed for interpretation.
+## between.group = FALSE below retains within-group bin summaries (the quantities
+## needed for Ptk/BPtk/BRPtk/Binwt) and avoids thousands of redundant pairwise
+## comparisons among Season/Context groups. Bin-level analysis itself remains mandatory.
+treat_multi <- data.frame(
+  SampleType = as.character(meta$SampleType),
+  Season_SampleType = meta$Season_SampleType,
+  Cycle_Season_SampleType = meta$Cycle_Season_SampleType,
+  Context_SampleType = meta$Context_SampleType,
+  stringsAsFactors = FALSE
+)
+
+rownames(treat_multi) <- meta$SampleID
+
+## Avoid obscure icamp.bins() failures from singleton within-group levels.
+for (gc in colnames(treat_multi)) {
+  tab_gc <- table(treat_multi[[gc]])
+  if (any(tab_gc < 2)) {
+    bad_gc <- names(tab_gc)[tab_gc < 2]
+    stop(
+      "Bin-level grouping '", gc, "' contains level(s) with fewer than 2 samples: ",
+      paste(bad_gc, collapse = ", "),
+      ". Check metadata/replication before running icamp.bins()."
+    )
+  }
+}
+
+## Try the complete icamp.big() object first and fall back to its detail element if required.
+
+icamp_bin <- tryCatch({
+  icamp.bins(
+    icamp.detail = icamp_res,
+    treat = treat_multi,
+    clas = taxonomy,
+    silent = FALSE,
+    boot = TRUE,
+    rand.time = rand_time,
+    between.group = FALSE
+  )
+}, error = function(e1) {
+  message("Direct use of icamp_res in icamp.bins() failed; trying icamp_res$detail.")
+  message("Initial error: ", e1$message)
+  
+  if (!"detail" %in% names(icamp_res)) {
+    stop("icamp_res has no detail element; icamp.bins() cannot continue.")
+  }
+  
+  icamp.bins(
+    icamp.detail = icamp_res$detail,
+    treat = treat_multi,
+    clas = taxonomy,
+    silent = FALSE,
+    boot = TRUE,
+    rand.time = rand_time,
+    between.group = FALSE
+  )
+})
+
+saveRDS(icamp_bin, file.path(out_dir, "icamp_bin_level_results.rds"))
+
+bin_objects_to_save <- c("Wtuvk", "Ptk", "BPtk", "BRPtk", "Binwt")
+
+for (nm in bin_objects_to_save) {
+  if (nm %in% names(icamp_bin)) {
+    safe_write_csv(
+      icamp_bin[[nm]],
+      file.path(out_dir, paste0("iCAMP_bin_", nm, ".csv")),
+      row_names = FALSE
+    )
+  }
+}
+
+if ("Bin.TopClass" %in% names(icamp_bin)) {
+  btc <- as.data.frame(icamp_bin$Bin.TopClass, check.names = FALSE)
+  if ("Bin" %in% colnames(btc)) btc$Bin <- standardize_bin_id(btc$Bin)
+  safe_write_csv(btc, file.path(out_dir, "iCAMP_bin_Bin.TopClass.csv"), row_names = FALSE)
+}
+if (isTRUE(save_diagnostics) && "Class.Bin" %in% names(icamp_bin)) {
+  class_bin_export <- as.data.frame(icamp_bin$Class.Bin)
+  class_bin_export$ASV <- rownames(class_bin_export)
+  safe_write_csv(class_bin_export, file.path(out_dir, "iCAMP_bin_Class.Bin.csv"), row_names = FALSE)
+}
+
+message("Primary bin-level results saved.")
+```
+
+## 16. Extract ASV-to-bin membership
+
+```{r asv-bin-membership}
+extract_asv_bin_membership <- function(icamp_res, icamp_bin, out_dir) {
+
+  ## Preferred source: the primary iCAMP phylogenetic-binning object.
+  if (
+    "detail" %in% names(icamp_res) &&
+    !is.null(icamp_res$detail$taxabin) &&
+    !is.null(icamp_res$detail$taxabin$sp.bin)
+  ) {
+    cb <- as.data.frame(
+      icamp_res$detail$taxabin$sp.bin,
+      check.names = FALSE
+    )
+
+    cb$ASV <- rownames(cb)
+
+    if ("bin.id.new" %in% colnames(cb)) {
+      cb$Bin <- standardize_bin_id(cb$bin.id.new)
+    } else if (ncol(cb) >= 4) {
+      ## iCAMP taxa.binphy.big() defines the third sp.bin column as the final renewed bin ID.
+      cb$Bin <- standardize_bin_id(cb[[3]])
+    } else {
+      stop("The primary taxabin$sp.bin object does not contain the final bin identifier.")
+    }
+
+    cb <- cb %>%
+      select(ASV, everything())
+
+    write.csv(
+      cb,
+      file.path(out_dir, "ASV_to_Bin_membership.csv"),
+      row.names = FALSE
+    )
+
+    return(cb)
+  }
+
+  ## Fallback source for version-dependent icamp.bins() outputs.
+  if ("Class.Bin" %in% names(icamp_bin)) {
+    cb <- as.data.frame(
+      icamp_bin$Class.Bin,
+      check.names = FALSE
+    )
+
+    cb$ASV <- rownames(cb)
+
+    if ("Bin" %in% colnames(cb)) {
+      cb$Bin <- standardize_bin_id(cb$Bin)
+    } else {
+      stop("Class.Bin was found, but its Bin column is absent.")
+    }
+
+    cb <- cb %>%
+      select(ASV, everything())
+
+    write.csv(
+      cb,
+      file.path(out_dir, "ASV_to_Bin_membership.csv"),
+      row.names = FALSE
+    )
+
+    return(cb)
+  }
+
+  warning(
+    "ASV-to-bin membership could not be extracted automatically. ",
+    "Inspect icamp_res$detail$taxabin and icamp_bin manually."
+  )
+
+  NULL
+}
+
+class_bin_df <- extract_asv_bin_membership(
+  icamp_res = icamp_res,
+  icamp_bin = icamp_bin,
+  out_dir = out_dir
+)
+```
+
+## 17. Major-bin contribution heatmap and bar plot
+
+```{r major-bin-figure}
+## Attempt to extract bin-by-process contributions from common iCAMP outputs.
+## Column names differ among iCAMP versions; raw output tables are retained for manual inspection.
+
+prepare_bin_contribution_long <- function(icamp_bin, source = "BPtk") {
+  if (!source %in% names(icamp_bin)) return(NULL)
+
+  df <- as.data.frame(icamp_bin[[source]], check.names = FALSE)
+  required_cols <- c("GroupBasedOn", "Group", "Process")
+  if (!all(required_cols %in% colnames(df))) {
+    warning(source, " does not have the expected GroupBasedOn / Group / Process structure.")
+    return(NULL)
+  }
+
+  ## In icamp.bins(), bins are columns (e.g. bin1, bin2, ...), while Process is a row field.
+  bin_cols <- grep("^bin", colnames(df), ignore.case = TRUE, value = TRUE)
+  if (length(bin_cols) == 0) {
+    warning("No bin columns were detected in ", source, ".")
+    return(NULL)
+  }
+
+  df %>%
+    pivot_longer(
+      cols = all_of(bin_cols),
+      names_to = "Bin",
+      values_to = "Contribution"
+    ) %>%
+    mutate(
+      Contribution = as.numeric(Contribution),
+      Process = clean_process_name(Process),
+      ContributionType = source
+    ) %>%
+    filter(Process %in% process_order, is.finite(Contribution))
+}
+
+## BPtk is used for ranking/plotting because it retains the absolute contribution
+## of each bin to the community-level importance of each process.
+bin_long <- prepare_bin_contribution_long(icamp_bin, source = "BPtk")
+
+if (!is.null(bin_long) && nrow(bin_long) > 0) {
+  write_diagnostic_csv(
+    bin_long,
+    file.path(out_dir, "iCAMP_bin_contribution_long_auto.csv"),
+    row_names = FALSE
+  )
+  
+  bin_plot_long <- bin_long %>%
+    filter(GroupBasedOn == "SampleType", Group %in% target_sample_types)
+
+  ## Rank bins by their summed absolute BPtk contribution across BZ/EZ and processes.
+  top_bin_total <- bin_plot_long %>%
+    group_by(Bin) %>%
+    summarise(Total = sum(abs(Contribution), na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(Total)) %>%
+    slice_head(n = 25)
+  
+  top_bins <- top_bin_total$Bin
+  
+  heat_df <- bin_plot_long %>%
+    filter(Bin %in% top_bins) %>%
+    group_by(Bin, Process) %>%
+    summarise(Contribution = mean(Contribution, na.rm = TRUE), .groups = "drop") %>%
+    left_join(top_bin_total, by = "Bin")
+  
+  heat_df$Bin <- factor(heat_df$Bin, levels = rev(top_bin_total$Bin))
+  heat_df$Process <- factor(heat_df$Process, levels = process_order)
+  
+  p_heat <- ggplot(heat_df, aes(x = Process, y = Bin, fill = Contribution)) +
+    geom_tile(color = "grey80", linewidth = 0.3) +
+    scale_fill_gradient(low = "white", high = "#2C7FB8") +
+    theme_bw(base_size = 11) +
+    labs(
+      x = NULL,
+      y = NULL,
+      fill = "Contribution",
+      title = "Top phylogenetic bins contributing to assembly processes"
+    ) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(hjust = 0.5)
+    )
+  
+  p_bar <- ggplot(top_bin_total, aes(x = Total, y = factor(Bin, levels = rev(Bin)))) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = round(Total, 3)), hjust = -0.1, size = 3) +
+    theme_bw(base_size = 11) +
+    labs(
+      x = "Total contribution",
+      y = NULL,
+      title = "Total bin contribution"
+    ) +
+    theme(
+      panel.grid.major.y = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      plot.title = element_text(hjust = 0.5)
+    )
+  
+  p_bin_combined <- p_heat + p_bar + plot_layout(widths = c(2.2, 1))
+  
+  ggsave(
+    filename = file.path(out_dir, "Plot_Top25_bin_process_heatmap_bar.pdf"),
+    plot = p_bin_combined,
+    width = 10,
+    height = 8
+  )
+  
+  if (isTRUE(save_png)) {
+    ggsave(
+      filename = file.path(out_dir, "Plot_Top25_bin_process_heatmap_bar.png"),
+      plot = p_bin_combined,
+      width = 10,
+      height = 8,
+      dpi = 300
+    )
+  }
+}
+```
+
+## 18. Representative phylogenetic tree of bins
+
+```{r representative-bin-tree}
+
+if (!is.null(class_bin_df) && all(c("ASV", "Bin") %in% colnames(class_bin_df))) {
+
+  asv_abund <- colSums(comm)
+
+  abund_df <- data.frame(
+    ASV = names(asv_abund),
+    TotalAbundance = as.numeric(asv_abund),
+    stringsAsFactors = FALSE
+  )
+
+  bin_rep <- class_bin_df %>%
+    select(ASV, Bin, everything()) %>%
+    inner_join(abund_df, by = "ASV") %>%
+    group_by(Bin) %>%
+    slice_max(
+      order_by = TotalAbundance,
+      n = 1,
+      with_ties = FALSE
+    ) %>%
+    ungroup()
+
+  write.csv(
+    bin_rep,
+    file.path(out_dir, "Representative_ASV_for_each_bin.csv"),
+    row.names = FALSE
+  )
+
+  rep_asvs <- bin_rep$ASV
+  names(rep_asvs) <- as.character(bin_rep$Bin)
+
+  rep_asvs <- rep_asvs[rep_asvs %in% tree$tip.label]
+
+  if (length(rep_asvs) >= 3) {
+
+    bin_tree <- ape::keep.tip(
+      tree,
+      as.character(rep_asvs)
+    )
+
+    bin_map <- data.frame(
+      ASV = as.character(rep_asvs),
+      Bin = names(rep_asvs),
+      stringsAsFactors = FALSE
+    )
+
+    bin_tree$tip.label <- bin_map$Bin[
+      match(bin_tree$tip.label, bin_map$ASV)
+    ]
+
+    ape::write.tree(
+      bin_tree,
+      file.path(out_dir, "Representative_bin_tree.nwk")
+    )
+
+    rep_tree_pdf <- file.path(out_dir, "Plot_Representative_bin_tree.pdf")
+
+    if (requireNamespace("ggtree", quietly = TRUE)) {
+      p_tree <- ggtree::ggtree(bin_tree) +
+        ggtree::geom_tiplab(size = 3) +
+        ggplot2::ggtitle("Representative phylogenetic tree of bins")
+
+      ggsave(
+        filename = rep_tree_pdf,
+        plot = p_tree,
+        width = 8,
+        height = 10
+      )
+    } else {
+      pdf(rep_tree_pdf, width = 8, height = 10)
+      plot(bin_tree, cex = 0.7)
+      title("Representative phylogenetic tree of bins")
+      dev.off()
+    }
+
+  } else {
+    warning(
+      "Fewer than three representative ASVs were available for the ",
+      "representative-bin tree; plotting skipped."
+    )
+  }
+}
+```
+
+## 19. Optional prevalence-sensitivity analysis
+
+```{r prevalence-sensitivity}
+if (run_prevalence_sensitivity) {
+  sens_prev_dir <- file.path(out_dir, "Sensitivity_prevalence")
+  dir.create(sens_prev_dir, showWarnings = FALSE, recursive = TRUE)
+
+  sens_prev_summary <- list()
+  sens_prev_counts <- list()
+
+  for (mp in sensitivity_min_prevalence_n) {
+    message("Running prevalence sensitivity: minimum detection count = ", mp)
+
+    keep_asvs <- colnames(comm)[colSums(comm > 0) >= mp]
+
+    if (length(keep_asvs) < 50) {
+      warning(
+        "Prevalence sensitivity minPrev", mp,
+        " retained fewer than 50 ASVs. Interpret this sensitivity run cautiously."
+      )
+    }
+
+    comm_p <- comm[, keep_asvs, drop = FALSE]
+    if (length(keep_asvs) < 2L || any(rowSums(comm_p) <= 0)) {
+      stop("Prevalence sensitivity minPrev", mp,
+           " leaves fewer than two ASVs or a zero-library sample.")
+    }
+    tree_p <- ape::keep.tip(tree, keep_asvs)
+
+    p_out <- file.path(sens_prev_dir, paste0("minPrev", mp))
+    p_pd <- file.path(p_out, "pd_big")
+
+    dir.create(p_out, showWarnings = FALSE, recursive = TRUE)
+    if (dir.exists(p_pd)) unlink(p_pd, recursive = TRUE, force = TRUE)
+    dir.create(p_pd, showWarnings = FALSE, recursive = TRUE)
+
+    set.seed(seed_main + mp * 100)
+
+    res_p <- icamp.big(
+      comm = comm_p,
+      tree = tree_p,
+      pd.wd = p_pd,
+      rand = rand_time,
+      prefix = paste0("iCAMP_prevalence_minPrev", mp, "_bin", bin_size_limit),
+      ds = 0.2,
+      pd.cut = NA,
+      sp.check = TRUE,
+      phylo.rand.scale = "within.bin",
+      taxa.rand.scale = "across.all",
+      phylo.metric = phylo_metric,
+      sig.index = sig_index,
+      bin.size.limit = bin_size_limit,
+      nworker = nworker,
+      memory.G = memory_G,
+      rtree.save = FALSE,
+      detail.save = FALSE,
+      qp.save = FALSE,
+      detail.null = FALSE,
+      ignore.zero = TRUE,
+      output.wd = p_out,
+      unit.sum = rowSums(comm_p),
+      correct.special = TRUE,
+      ses.cut = 1.96,
+      rc.cut = 0.95,
+      conf.cut = 0.975
+    )
+
+    saveRDS(
+      res_p,
+      file.path(p_out, paste0("icamp_res_minPrev", mp, ".rds"))
+    )
+
+    proc_p <- find_icamp_process_table(res_p)$table
+    colnames(proc_p)[1:2] <- c("Sample1", "Sample2")
+
+    bt_p <- run_icamp_boot_one_group(
+      group_col = "Season_SampleType",
+      process_table = proc_p,
+      meta = meta,
+      out_dir = p_out
+    )
+
+    if (!is.null(bt_p) && !is.null(bt_p$summary)) {
+      tmp_summary <- as.data.frame(bt_p$summary)
+      tmp_summary$SensitivityMinPrevalenceN <- mp
+      sens_prev_summary[[paste0("minPrev", mp)]] <- tmp_summary
+    }
+
+    sens_prev_counts[[paste0("minPrev", mp)]] <- data.frame(
+      SensitivityMinPrevalenceN = mp,
+      NASVs = ncol(comm_p),
+      FractionOfPrimaryASVs = ncol(comm_p) / ncol(comm)
+    )
+  }
+
+  write.csv(
+    bind_rows(sens_prev_counts),
+    file.path(sens_prev_dir, "prevalence_sensitivity_ASV_counts.csv"),
+    row.names = FALSE
+  )
+
+  if (length(sens_prev_summary) > 0) {
+    write.csv(
+      bind_rows(sens_prev_summary),
+      file.path(sens_prev_dir, "prevalence_sensitivity_Season_SampleType_summaries.csv"),
+      row.names = FALSE
+    )
+  }
+
+  saveRDS(
+    sens_prev_summary,
+    file.path(sens_prev_dir, "prevalence_sensitivity_summary_all.rds")
+  )
+}
+
+## ------------------------------------------------------------
+```
+
+## 20. Optional bin.size.limit sensitivity analysis
+
+```{r bin-size-sensitivity}
+if (run_bin_size_sensitivity) {
+  sens_dir <- file.path(out_dir, "Sensitivity_bin_size")
+  dir.create(sens_dir, showWarnings = FALSE, recursive = TRUE)
+
+  sens_summary <- list()
+
+  for (bsl in sensitivity_bin_sizes) {
+    message("Running bin-size sensitivity: bin.size.limit = ", bsl)
+
+    tmp_out <- file.path(sens_dir, paste0("bin_", bsl))
+    tmp_pd <- file.path(tmp_out, "pd_big")
+
+    dir.create(tmp_out, showWarnings = FALSE, recursive = TRUE)
+    if (dir.exists(tmp_pd)) unlink(tmp_pd, recursive = TRUE, force = TRUE)
+    dir.create(tmp_pd, showWarnings = FALSE, recursive = TRUE)
+
+    set.seed(seed_main + bsl * 10)
+
+    tmp_res <- icamp.big(
+      comm = comm,
+      tree = tree,
+      pd.wd = tmp_pd,
+      rand = rand_time,
+      prefix = paste0("iCAMP_sensitivity_bin", bsl),
+      ds = 0.2,
+      pd.cut = NA,
+      sp.check = TRUE,
+      phylo.rand.scale = "within.bin",
+      taxa.rand.scale = "across.all",
+      phylo.metric = phylo_metric,
+      sig.index = sig_index,
+      bin.size.limit = bsl,
+      nworker = nworker,
+      memory.G = memory_G,
+      rtree.save = FALSE,
+      detail.save = FALSE,
+      qp.save = FALSE,
+      detail.null = FALSE,
+      ignore.zero = TRUE,
+      output.wd = tmp_out,
+      unit.sum = rowSums(comm),
+      correct.special = TRUE,
+      ses.cut = 1.96,
+      rc.cut = 0.95,
+      conf.cut = 0.975
+    )
+
+    saveRDS(
+      tmp_res,
+      file.path(tmp_out, paste0("icamp_res_bin", bsl, ".rds"))
+    )
+
+    tmp_proc <- find_icamp_process_table(tmp_res)$table
+    colnames(tmp_proc)[1:2] <- c("Sample1", "Sample2")
+
+    tmp_boot <- run_icamp_boot_one_group(
+      group_col = "Season_SampleType",
+      process_table = tmp_proc,
+      meta = meta,
+      out_dir = tmp_out
+    )
+
+    if (!is.null(tmp_boot) && !is.null(tmp_boot$summary)) {
+      tmp_summary <- as.data.frame(tmp_boot$summary)
+      tmp_summary$BinSizeLimit <- bsl
+      sens_summary[[paste0("bin_", bsl)]] <- tmp_summary
+    }
+  }
+
+  if (length(sens_summary) > 0) {
+    write.csv(
+      bind_rows(sens_summary),
+      file.path(sens_dir, "bin_size_sensitivity_Season_SampleType_summaries.csv"),
+      row.names = FALSE
+    )
+  }
+
+  saveRDS(
+    sens_summary,
+    file.path(sens_dir, "sensitivity_summary_all.rds")
+  )
+}
+
+## ------------------------------------------------------------
+```
+
+## 21. Optional independent SampleType regional-pool sensitivity
+
+Optional sensitivity analysis in which BZ and EZ are given independent regional pools. The primary analysis continues to use the shared BZ/EZ tree-matched regional pool.
+
+```{r sampletype-pool-sensitivity}
+if (run_stage_specific_pool_sensitivity) {
+  sens_stage_dir <- file.path(
+    out_dir,
+    "Sensitivity_stage_specific_regional_pool"
+  )
+
+  dir.create(
+    sens_stage_dir,
+    showWarnings = FALSE,
+    recursive = TRUE
+  )
+
+  stage_pool_counts <- list()
+
+  for (stype in target_sample_types) {
+    message("Running independent regional-pool sensitivity for SampleType: ", stype)
+
+    ids <- meta$SampleID[as.character(meta$SampleType) == stype]
+    comm_s0 <- comm_core_raw[ids, , drop = FALSE]
+
+    ## Start from the unfiltered core ASV matrix for the selected SampleType.
+    stage_observed_asvs <- colnames(comm_s0)[colSums(comm_s0) > 0]
+    stage_tree_asvs <- stage_observed_asvs[
+      stage_observed_asvs %in% tree$tip.label
+    ]
+
+    comm_s <- comm_s0[, stage_tree_asvs, drop = FALSE]
+    if (length(stage_tree_asvs) < 2L || length(ids) < 3L) {
+      stop("Insufficient samples or tree-matched ASVs for stage-specific pool: ", stype)
+    }
+    tree_s <- ape::keep.tip(tree, stage_tree_asvs)
+    meta_s <- meta[match(rownames(comm_s), meta$SampleID), , drop = FALSE]
+
+    if (any(rowSums(comm_s) <= 0)) {
+      stop(
+        "At least one ", stype,
+        " sample has zero counts after stage-specific tree matching."
+      )
+    }
+
+    stage_pool_counts[[stype]] <- data.frame(
+      SampleType = stype,
+      NSamples = nrow(comm_s),
+      NASVsObservedBeforeTreeMatch = length(stage_observed_asvs),
+      NASVsTreeMatched = ncol(comm_s),
+      AbundanceCoverage = sum(comm_s) / sum(comm_s0)
+    )
+
+    s_out <- file.path(sens_stage_dir, stype)
+    s_pd <- file.path(s_out, "pd_big")
+
+    dir.create(s_out, showWarnings = FALSE, recursive = TRUE)
+    if (dir.exists(s_pd)) unlink(s_pd, recursive = TRUE, force = TRUE)
+    dir.create(s_pd, showWarnings = FALSE, recursive = TRUE)
+
+    set.seed(seed_main + match(stype, target_sample_types) * 1000)
+
+    res_s <- icamp.big(
+      comm = comm_s,
+      tree = tree_s,
+      pd.wd = s_pd,
+      rand = rand_time,
+      prefix = paste0("iCAMP_stage_pool_", stype),
+      ds = 0.2,
+      pd.cut = NA,
+      sp.check = TRUE,
+      phylo.rand.scale = "within.bin",
+      taxa.rand.scale = "across.all",
+      phylo.metric = phylo_metric,
+      sig.index = sig_index,
+      bin.size.limit = bin_size_limit,
+      nworker = nworker,
+      memory.G = memory_G,
+      rtree.save = FALSE,
+      detail.save = FALSE,
+      qp.save = FALSE,
+      detail.null = FALSE,
+      ignore.zero = TRUE,
+      output.wd = s_out,
+      unit.sum = rowSums(comm_s),
+      correct.special = TRUE,
+      ses.cut = 1.96,
+      rc.cut = 0.95,
+      conf.cut = 0.975
+    )
+
+    saveRDS(
+      res_s,
+      file.path(s_out, "icamp_res.rds")
+    )
+
+    proc_s <- find_icamp_process_table(res_s)$table
+
+    bt_s <- run_icamp_boot_one_group(
+      "Season",
+      proc_s,
+      meta_s,
+      s_out
+    )
+
+    if (!is.null(bt_s)) {
+      plot_icamp_boot_bar(
+        bt_s,
+        paste0("Season_", stype),
+        s_out
+      )
+    }
+  }
+
+  write.csv(
+    bind_rows(stage_pool_counts),
+    file.path(
+      sens_stage_dir,
+      "stage_specific_regional_pool_ASV_and_coverage_summary.csv"
+    ),
+    row.names = FALSE
+  )
+}
+```
+
+## 22. README and reproducibility records
+```{r reproducibility-records}
+readme_lines <- c(
+  "iCAMP analysis of bacterial ASV communities across brewing cycles",
+  "==============================================================",
+  "",
+  "OUTPUT POLICY",
+  "Default outputs are restricted to primary results, compact QC summaries and reproducibility records; reconstructable intermediate tables are diagnostic-only.",
+  "",
+  "PRIMARY ASV INCLUSION RULE",
+  "The primary iCAMP analysis does not apply an additional prevalence filter.",
+  "All ASVs observed in at least one core sample and represented in the phylogenetic tree are retained.",
+  "The primary regional pool is shared by BZ and EZ to preserve a common phylogenetic/binning framework.",
+  "",
+  "CORE SAMPLE POOL",
+  "Only Cycle1/Cycle2 and SampleType BZ/EZ are included in the primary analysis.",
+  "Boundary_Pre, Boundary_Post and Qu samples are excluded.",
+  "Core metadata samples missing from the ASV table are never dropped silently: a compact QC summary is always written and missing samples trigger a warning plus a detail file.",
+  "",
+  "WHY THIS DIFFERS FROM SINGLE-ASV DIFFERENTIAL-ABUNDANCE FILTERING",
+  "iCAMP first partitions taxa into phylogenetic bins and applies bin-level null models.",
+  "Removing ASVs can alter bin membership, null-model space and abundance-weighted process estimates.",
+  "Therefore, prevalence filtering is not imposed on the primary tree-matched ASV community.",
+  "",
+  "TREE MATCHING",
+  "Only ASVs present in both the core ASV matrix and the phylogenetic tree can enter iCAMP.",
+  "Tree coverage is reported by ASV count and, more importantly, by abundance coverage overall, by SampleType and per sample.",
+  "Interpretation is restricted to the phylogenetically represented community.",
+  "",
+  "TAXONOMY QC",
+  "Taxonomy is optional and does not define iCAMP bins or process estimates.",
+  "A compact taxonomy-matching summary is always written when taxonomy.tsv exists; low coverage triggers a warning and unmatched final ASVs are listed once.",
+  "",
+  "OPTIONAL SENSITIVITY ANALYSES",
+  "Prevalence sensitivity: minPrev = 3 and 9 core samples.",
+  "Bin-size sensitivity: bin.size.limit = 12, 24 and 48.",
+  "Independent SampleType regional pools: BZ and EZ are rerun separately from the unfiltered core ASV matrix.",
+  "",
+  "DESIGN INTERPRETATION",
+  "Year is used for traceability/QC and is not a complete annual replicate.",
+  "BrewingCycle is the complete brewing-cycle replicate.",
+  "For BZ/EZ, BrewingCycle labels are strictly checked against the fixed Year × Season design mapping before analysis.",
+  "Season denotes the brewing season/production period.",
+  "Park and WorkshopAge are one-to-one and are interpreted as a composite production background.",
+  "",
+  "PRIMARY GROUPINGS",
+  "SampleType bootstrap for overall BZ/EZ profiles",
+  "Season effects are handled by context-level summaries/inference rather than a second bootstrap grouping",
+  "",
+  "CONTEXT-LEVEL INFERENCE",
+  "Context_SampleType = BrewingCycle × Season × Park × SampleType.",
+  "Context-level Season tests use context summaries and control for nonconstant BrewingCycle and Park factors.",
+  "Season bin summaries include all pairs within Season x SampleType, including cross-context pairs; context-level community summaries use within-context pairs only. These estimands are distinct.",
+  "This script uses a BZ/EZ-only primary pool with no additional prevalence filter; verify agreement with the manuscript before release.",
+  "",
+  "PROCESS TERMINOLOGY",
+  "DR_Others denotes drift and other weak/undominated processes; it is not interpreted as pure ecological drift.",
+  "Context-level, cross-cycle and cross-park summaries use the five mutually exclusive processes only; Stochasticity is an aggregate and is not treated as a sixth process.",
+  "",
+  "BIN-LEVEL ANALYSIS",
+  "icamp.bins() is always run for the primary analysis.",
+  "Wtuvk, Ptk, BPtk, BRPtk and Binwt are saved every run; Bin.TopClass is saved when available.",
+  "Primary icamp.bins uses between.group = FALSE; within-group bin summaries are retained without redundant pairwise group comparisons.",
+  "The pd_big cache is rebuilt for the primary analysis and for every enabled sensitivity run to avoid reusing phylogenetic distances from a different tree/ASV pool.",
+  "Custom ASV-to-bin and representative-tree outputs use bin IDs formatted as bin1, bin2, ... to match BPtk/Ptk/Binwt columns.",
+  "The native iCAMP label DR in bin-level outputs corresponds to DR_Others in this script.",
+  "",
+  "PRIORITY OUTPUTS",
+  "00_analysis_parameter_manifest.csv",
+  "QC_core_sample_matching_summary.csv",
+  "QC_tree_matching_coverage_summary.csv",
+  "QC_taxonomy_matching_summary.csv (when taxonomy.tsv exists)",
+  "QC_tree_matching_coverage_by_SampleType.csv",
+  "icamp_boot_summary_SampleType.csv",
+  "context_level_assembly_processes.csv",
+  "context_level_Season_SampleType_summary.csv",
+  "context_level_Season_effect_permutation_tests.csv",
+  "cross_cycle_reproducibility_by_Season_SampleType.csv",
+  "cross_park_context_process_consistency.csv",
+  "Plot_iCAMP_bar_SampleType.pdf",
+  "Plot_context_level_Season_by_SampleType.pdf",
+  "iCAMP_bin_Wtuvk.csv",
+  "iCAMP_bin_Ptk.csv",
+  "iCAMP_bin_BPtk.csv",
+  "iCAMP_bin_BRPtk.csv",
+  "iCAMP_bin_Binwt.csv",
+  "ASV_to_Bin_membership.csv",
+  "iCAMP_bin_Bin.TopClass.csv (when taxonomy is available)",
+  "Representative_ASV_for_each_bin.csv",
+  "Representative_bin_tree.nwk",
+  "Plot_Representative_bin_tree.pdf",
+  "Plot_Top25_bin_process_heatmap_bar.pdf"
+)
+
+writeLines(
+  readme_lines,
+  file.path(out_dir, "00_README_design_filtering_and_interpretation.txt")
+)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(out_dir, "00_sessionInfo.txt")
+)
+
+key_packages <- c(
+  "iCAMP",
+  "ape",
+  "vegan",
+  "data.table",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "phangorn",
+  "ggtree"
+)
+
+package_versions <- data.frame(
+  Package = key_packages,
+  Version = vapply(
+    key_packages,
+    function(pkg) {
+      if (requireNamespace(pkg, quietly = TRUE)) {
+        as.character(utils::packageVersion(pkg))
+      } else {
+        NA_character_
+      }
+    },
+    character(1)
+  ),
+  stringsAsFactors = FALSE
+)
+
+write_diagnostic_csv(
+  package_versions,
+  file.path(out_dir, "00_key_package_versions.csv")
+)
+
+message("All analyses completed.")
+message("Primary output directory: ", out_dir)
+```
