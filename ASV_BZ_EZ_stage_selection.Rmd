@@ -1,0 +1,1554 @@
+---
+title: "BZ–EZ Stage-associated ASV Selection Analysis"
+date: "2026-09-12"
+output:
+  github_document:
+    toc: true
+    toc_depth: 3
+---
+
+# Overview
+
+This R Markdown file provides the code used to identify ASVs showing
+stage-associated enrichment or depletion between pre-fermentation grains
+(BZ) and pre-fermentation grains (EZ).
+
+## Analysis principles
+
+1. Raw integer ASV counts are used as the input for ANCOM-BC2.
+2. Relative abundance is calculated using the library size after basic QC and
+   before prevalence filtering, so the denominator remains fixed downstream.
+3. ASVs are retained when prevalence is at least 10% in at least one
+   Stage × Season group, forming one common BZ–EZ union feature space.
+4. Complete matched BZ–EZ production contexts are selected only after the union
+   feature space has been fixed.
+5. The global stage effect is tested once using ANCOM-BC2 with
+   `fix_formula = "BrewingGroupID + Stage"`, where
+   `BrewingGroupID = BrewingCycle × Season × Park`.
+6. Descriptive aggregation follows:
+   biological replicates → Cycle context → Park × Season → Season/Park → Overall.
+7. The descriptive aggregation statistic is the median throughout.
+
+## Main outputs
+
+The workflow writes QC files, the Stage × Season prevalence-filter table,
+matched-context summaries, the single global ANCOM-BC2 result, median-based
+recurrence diagnostics, DeltaCLR heterogeneity diagnostics, the final
+one-row-per-ASV evidence table, and stage-specific core-ASV summaries.
+
+The output directory also contains a parameter manifest and `sessionInfo()` to
+support reproducibility.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r initialize}
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+set.seed(20260723)
+```
+
+## 0. Parameters
+
+```{r parameters}
+## Change these four lines when switching Bacteria / Fungi.
+DATASET_LABEL <- "Bacteria"
+OTU_FILE  <- "ASV_table_delete.tsv"
+META_FILE <- "sample_metadata.xlsx"
+TAX_FILE  <- "Taxonomy.tsv"   # set to "" if unavailable
+
+OTU_SHEET  <- NULL
+META_SHEET <- NULL
+TAX_SHEET  <- NULL
+
+OUT_DIR <- paste0(DATASET_LABEL, "BZ_EZ_stage_selection")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+SAMPLE_ID_COL <- "SampleID"
+TYPE_COL      <- "SampleType"
+YEAR_COL      <- "Year"
+SEASON_COL    <- "Season"
+PARK_COL      <- "Park"
+REP_COL       <- "Replicate"
+CYCLE_COL     <- "BrewingCycle"
+
+AUTO_DERIVE_CYCLE_IF_MISSING <- TRUE
+STRICT_CYCLE_CHECK <- TRUE
+
+CORE_CYCLES    <- c("Cycle1", "Cycle2")
+SEASON_LEVELS  <- c("Spring", "Summer", "Autumn", "Winter")
+EXPECTED_PARKS <- c("70", "30", "5")
+ANALYSIS_TYPES <- c("BZ", "EZ")
+EXPECTED_N_BIOREP <- 3
+
+## Keep an ASV if prevalence >=10% in at least one Stage × Season group.
+PREVALENCE_CUT_PRIMARY <- 0.10
+
+## Descriptive thresholds.
+HIGH_ABUND    <- 0.001       # 0.1%
+MIN_REP_PREV  <- 2/3         # detected in >=2 of 3 biological replicates
+MIN_UNIT_PREV <- 2/3         # descriptive prevalence requirement
+
+RESPONSE_FOLD_CUTOFF <- 2
+LFC_RESPONSE <- log2(RESPONSE_FOLD_CUTOFF)
+
+## Persistent_candidate is auxiliary and is deliberately more conservative
+## than the 2-fold response cutoff, avoiding overlap in interpretation.
+PERSISTENT_MAX_FOLD_CHANGE <- 1.25
+LFC_PERSISTENT_MAX <- log2(PERSISTENT_MAX_FOLD_CHANGE)
+
+## One descriptive pseudo-count only. It is used only to make log2(EZ/BZ)
+## finite when a descriptive abundance equals zero. It is NOT a robustness
+## criterion and has no role in ANCOM-BC2 significance.
+RATIO_PSEUDOCOUNT_MULTIPLIER <- 0.5
+CLR_PSEUDOCOUNT_COUNT <- 0.5
+
+FDR_CUTOFF <- 0.05
+
+RUN_ANCOMBC2 <- TRUE
+ANCOM_P_ADJ_METHOD <- "BH"
+ANCOM_PSEUDO_SENS  <- TRUE
+ANCOM_PRV_CUT <- 0
+ANCOM_NEG_LB <- FALSE
+ANCOM_N_CL <- 1
+
+SUMMARY_METHOD <- "median"
+```
+
+## 1. Packages
+
+```{r packages}
+cran_pkgs <- c("dplyr", "tidyr", "readr", "tibble")
+missing_cran <- cran_pkgs[!vapply(cran_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_cran) > 0) {
+  stop("Missing CRAN packages: ", paste(missing_cran, collapse = ", "))
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(tibble)
+})
+
+if (RUN_ANCOMBC2) {
+  bioc_needed <- c("ANCOMBC", "TreeSummarizedExperiment", "S4Vectors")
+  missing_bioc <- bioc_needed[!vapply(bioc_needed, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing_bioc) > 0) {
+    stop("RUN_ANCOMBC2 = TRUE but required packages are missing: ",
+         paste(missing_bioc, collapse = ", "))
+  }
+  if (!exists("ancombc2", where = asNamespace("ANCOMBC"), inherits = FALSE)) {
+    stop("ANCOMBC::ancombc2() is unavailable in the installed ANCOMBC package.")
+  }
+}
+```
+
+## 2. Utility functions
+
+```{r utility-functions}
+read_auto <- function(path, sheet = NULL) {
+  if (!file.exists(path)) stop("File not found: ", path)
+  ext <- tolower(tools::file_ext(path))
+
+  if (ext == "csv") {
+    return(readr::read_csv(path, show_col_types = FALSE, name_repair = "minimal"))
+  }
+  if (ext %in% c("tsv", "txt")) {
+    return(readr::read_tsv(path, show_col_types = FALSE, name_repair = "minimal"))
+  }
+  if (ext %in% c("xlsx", "xls")) {
+    if (!requireNamespace("readxl", quietly = TRUE)) stop("Excel input requires package 'readxl'.")
+    if (is.null(sheet)) sheet <- 1
+    return(readxl::read_excel(path, sheet = sheet, .name_repair = "minimal") %>%
+             as.data.frame(check.names = FALSE) %>% tibble::as_tibble())
+  }
+  stop("Unsupported file type: ", ext)
+}
+
+as_numeric_matrix_strict <- function(x, object_name = "OTU table") {
+  raw <- as.matrix(x)
+  suppressWarnings(num <- matrix(as.numeric(raw), nrow = nrow(raw), ncol = ncol(raw),
+                                 dimnames = dimnames(raw)))
+  raw_chr <- trimws(as.character(raw))
+  bad <- is.na(as.vector(num)) & !is.na(as.vector(raw)) & nzchar(raw_chr) &
+    !toupper(raw_chr) %in% c("NA", "NAN")
+  if (any(bad)) {
+    stop(object_name, " contains non-numeric values, e.g. ",
+         paste(head(unique(raw_chr[bad]), 10), collapse = ", "))
+  }
+  num
+}
+
+normalize_season <- function(x) {
+  x <- trimws(as.character(x))
+
+  key <- tolower(x)
+  map <- c(
+    "spring" = "Spring",
+    "summer" = "Summer",
+    "autumn" = "Autumn",
+    "fall" = "Autumn",
+    "winter" = "Winter"
+  )
+
+  hit <- key %in% names(map)
+  x[hit] <- unname(map[key[hit]])
+  x
+}
+
+derive_brewing_cycle <- function(year, season) {
+  y <- as.character(year)
+  s <- normalize_season(season)
+  dplyr::case_when(
+    y == "2023" & s == "Spring" ~ "Boundary_Pre",
+    y == "2023" & s %in% c("Summer", "Autumn", "Winter") ~ "Cycle1",
+    y == "2024" & s == "Spring" ~ "Cycle1",
+    y == "2024" & s %in% c("Summer", "Autumn", "Winter") ~ "Cycle2",
+    y == "2025" & s == "Spring" ~ "Cycle2",
+    y == "2025" & s == "Summer" ~ "Boundary_Post",
+    TRUE ~ "Unassigned"
+  )
+}
+
+summary_value <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  stats::median(x)
+}
+
+safe_ratio <- function(num, den, pc) {
+  log2((num + pc) / (den + pc))
+}
+
+sign_class <- function(x) {
+  dplyr::case_when(
+    is.na(x) ~ NA_character_,
+    x > 0 ~ "Up",
+    x < 0 ~ "Down",
+    TRUE ~ "Zero"
+  )
+}
+
+strong_response_class <- function(x) {
+  dplyr::case_when(
+    is.na(x) ~ NA_character_,
+    x >= LFC_RESPONSE ~ "Up_2fold_or_more",
+    x <= -LFC_RESPONSE ~ "Down_2fold_or_more",
+    TRUE ~ "Below_2fold"
+  )
+}
+
+factor_block_p_available <- function(dat, response, target_factor, covariates = character(0)) {
+  vars_needed <- unique(c(response, target_factor, covariates))
+  vars_needed <- vars_needed[vars_needed %in% names(dat)]
+  dat <- dat[complete.cases(dat[, vars_needed, drop = FALSE]), , drop = FALSE]
+
+  if (nrow(dat) < 3) return(NA_real_)
+  if (length(unique(dat[[target_factor]])) < 2) return(NA_real_)
+
+  cov_keep <- covariates[vapply(covariates, function(v) {
+    v %in% names(dat) && length(unique(na.omit(dat[[v]]))) > 1
+  }, logical(1))]
+
+  reduced_rhs <- if (length(cov_keep) == 0) "1" else paste(cov_keep, collapse = " + ")
+  full_rhs <- paste(unique(c(target_factor, cov_keep)), collapse = " + ")
+  f0 <- as.formula(paste(response, "~", reduced_rhs))
+  f1 <- as.formula(paste(response, "~", full_rhs))
+
+  tryCatch({
+    m0 <- lm(f0, data = dat)
+    m1 <- lm(f1, data = dat)
+    if (df.residual(m1) <= 0) return(NA_real_)
+    a <- anova(m0, m1)
+    p <- suppressWarnings(as.numeric(a$`Pr(>F)`[2]))
+    if (!is.finite(p)) NA_real_ else p
+  }, error = function(e) NA_real_)
+}
+
+stage_season_prevalence <- function(count_mat, meta_df, stage_name, season_name,
+                                    prevalence_cut = PREVALENCE_CUT_PRIMARY) {
+  sample_ids <- meta_df %>%
+    filter(as.character(Stage) == stage_name,
+           as.character(Season) == season_name) %>%
+    pull(SampleID) %>% as.character()
+  sample_ids <- intersect(sample_ids, colnames(count_mat))
+
+  if (length(sample_ids) == 0) {
+    return(tibble(
+      Stage = stage_name,
+      Season = season_name,
+      TaxonID = rownames(count_mat),
+      NSamplesStageSeason = 0L,
+      DetectedN = 0L,
+      Prevalence = NA_real_,
+      RequiredDetectedN = NA_integer_,
+      KeepStageSeason = FALSE
+    ))
+  }
+
+  detected_n <- rowSums(count_mat[, sample_ids, drop = FALSE] > 0)
+  prevalence <- detected_n / length(sample_ids)
+
+  tibble(
+    Stage = stage_name,
+    Season = season_name,
+    TaxonID = rownames(count_mat),
+    NSamplesStageSeason = length(sample_ids),
+    DetectedN = as.integer(detected_n),
+    Prevalence = as.numeric(prevalence),
+    RequiredDetectedN = ceiling(prevalence_cut * length(sample_ids)),
+    KeepStageSeason = prevalence >= prevalence_cut
+  )
+}
+
+build_context_clr <- function(count_mat, meta_df, taxa_ids, sample_ids) {
+  taxa_ids <- intersect(taxa_ids, rownames(count_mat))
+  sample_ids <- intersect(sample_ids, colnames(count_mat))
+  if (length(taxa_ids) < 2) stop("CLR requires at least two taxa.")
+
+  cm <- count_mat[taxa_ids, sample_ids, drop = FALSE]
+  if (any(colSums(cm) <= 0)) stop("Zero-total sample in CLR matrix.")
+
+  clr_mat <- apply(cm, 2, function(x) {
+    lx <- log(x + CLR_PSEUDOCOUNT_COUNT)
+    lx - mean(lx)
+  })
+  if (is.vector(clr_mat)) {
+    clr_mat <- matrix(clr_mat, nrow = nrow(cm), ncol = ncol(cm), dimnames = dimnames(cm))
+  }
+  rownames(clr_mat) <- rownames(cm)
+  colnames(clr_mat) <- colnames(cm)
+
+  as.data.frame(t(clr_mat), check.names = FALSE) %>%
+    rownames_to_column("SampleID") %>% as_tibble() %>%
+    pivot_longer(cols = -SampleID, names_to = "TaxonID", values_to = "CLR") %>%
+    left_join(meta_df, by = "SampleID") %>%
+    group_by(BrewingCycle, Season, Park, BrewingGroupID, Stage, TaxonID) %>%
+    summarise(
+      CLR = summary_value(CLR),
+      NBioRep = n(),
+      .groups = "drop"
+    )
+}
+```
+
+## 3. Metadata: BZ and EZ only
+
+```{r metadata}
+meta_raw <- read_auto(META_FILE, META_SHEET)
+required_cols <- c(SAMPLE_ID_COL, TYPE_COL, YEAR_COL, SEASON_COL, PARK_COL, REP_COL)
+missing_cols <- setdiff(required_cols, names(meta_raw))
+if (length(missing_cols) > 0) {
+  stop("Metadata is missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+
+meta_work <- meta_raw %>%
+  mutate(
+    .SampleID = trimws(as.character(.data[[SAMPLE_ID_COL]])),
+    .Stage = toupper(trimws(as.character(.data[[TYPE_COL]]))),
+    .Year = as.character(.data[[YEAR_COL]]),
+    .Season = normalize_season(.data[[SEASON_COL]]),
+    .Park = trimws(as.character(.data[[PARK_COL]])),
+    .Replicate = as.character(.data[[REP_COL]])
+  )
+meta_work$.ExpectedCycle <- derive_brewing_cycle(meta_work$.Year, meta_work$.Season)
+
+if (!CYCLE_COL %in% names(meta_work)) {
+  if (!AUTO_DERIVE_CYCLE_IF_MISSING) stop("BrewingCycle is absent and automatic derivation is disabled.")
+  meta_work[[CYCLE_COL]] <- meta_work$.ExpectedCycle
+}
+meta_work$.BrewingCycle <- as.character(meta_work[[CYCLE_COL]])
+
+cycle_mismatch <- meta_work %>%
+  transmute(
+    SampleID = .SampleID,
+    BrewingCycle_metadata = .BrewingCycle,
+    BrewingCycle_expected = .ExpectedCycle,
+    Match = BrewingCycle_metadata == BrewingCycle_expected
+  ) %>%
+  filter(BrewingCycle_expected != "Unassigned", is.na(Match) | !Match)
+
+if (nrow(cycle_mismatch) > 0 && STRICT_CYCLE_CHECK) {
+  write.csv(cycle_mismatch,
+            file.path(OUT_DIR, "ERROR_BrewingCycle_mapping_mismatch.csv"),
+            row.names = FALSE)
+  stop("BrewingCycle mapping mismatch detected.")
+}
+
+meta <- meta_work %>%
+  transmute(
+    SampleID = .SampleID,
+    Stage = .Stage,
+    Year = .Year,
+    Season = .Season,
+    Park = .Park,
+    Replicate = .Replicate,
+    BrewingCycle = .BrewingCycle
+  ) %>%
+  filter(BrewingCycle %in% CORE_CYCLES, Stage %in% ANALYSIS_TYPES)
+
+if (nrow(meta) == 0) stop("No BZ/EZ samples remain in Cycle1/Cycle2.")
+if (anyNA(meta) || any(!nzchar(meta$SampleID)) || any(!nzchar(meta$Replicate))) {
+  stop("Analysis metadata contains missing design fields or blank sample/replicate identifiers.")
+}
+if (anyDuplicated(meta$SampleID)) stop("Duplicated SampleID values found in metadata.")
+
+bad_seasons <- setdiff(unique(meta$Season), SEASON_LEVELS)
+if (length(bad_seasons) > 0) {
+  stop("Unrecognized Season values: ", paste(bad_seasons, collapse = ", "))
+}
+
+observed_parks <- sort(unique(meta$Park))
+if (!setequal(observed_parks, sort(EXPECTED_PARKS))) {
+  stop("Observed parks do not match EXPECTED_PARKS. Observed: ",
+       paste(observed_parks, collapse = "; "), "; expected: ",
+       paste(EXPECTED_PARKS, collapse = "; "))
+}
+
+meta <- meta %>%
+  mutate(
+    BrewingCycle = factor(BrewingCycle, levels = CORE_CYCLES),
+    Season = factor(Season, levels = SEASON_LEVELS),
+    Park = factor(Park, levels = EXPECTED_PARKS),
+    Stage = factor(Stage, levels = ANALYSIS_TYPES),
+    BrewingGroupID = paste(as.character(BrewingCycle), as.character(Season),
+                            as.character(Park), sep = "_")
+  )
+```
+
+## 4. OTU/ASV table + basic QC
+
+```{r asv-table-qc}
+otu_raw <- read_auto(OTU_FILE, OTU_SHEET)
+first_col_values <- as.character(otu_raw[[1]])
+overlap_cols <- sum(meta$SampleID %in% names(otu_raw))
+overlap_rows <- sum(meta$SampleID %in% first_col_values)
+if (overlap_cols == 0 && overlap_rows == 0) stop("No SampleID overlap between OTU table and metadata.")
+
+if (overlap_cols >= overlap_rows) {
+  taxa_id <- as.character(otu_raw[[1]])
+  otu_mat <- as_numeric_matrix_strict(otu_raw[, -1, drop = FALSE], "Taxa × Samples OTU table")
+  rownames(otu_mat) <- taxa_id
+} else {
+  sample_id <- as.character(otu_raw[[1]])
+  x <- as_numeric_matrix_strict(otu_raw[, -1, drop = FALSE], "Samples × Taxa OTU table")
+  rownames(x) <- sample_id
+  otu_mat <- t(x)
+}
+
+if (anyDuplicated(rownames(otu_mat))) stop("Duplicated TaxonID values found.")
+if (anyDuplicated(colnames(otu_mat))) stop("Duplicated SampleID columns found in OTU table.")
+if (any(!is.finite(otu_mat))) stop("OTU table contains NA/NaN/Inf.")
+if (any(otu_mat < 0)) stop("OTU table contains negative values.")
+if (any(abs(otu_mat - round(otu_mat)) > 1e-8)) stop("OTU table must contain raw integer counts.")
+
+common_samples <- intersect(meta$SampleID, colnames(otu_mat))
+if (length(common_samples) == 0) stop("No samples remain after OTU-metadata matching.")
+
+meta <- meta %>%
+  filter(SampleID %in% common_samples) %>%
+  arrange(BrewingCycle, Season, Park, Stage, Replicate)
+otu_mat <- otu_mat[, meta$SampleID, drop = FALSE]
+
+zero_samples <- colnames(otu_mat)[colSums(otu_mat) <= 0]
+if (length(zero_samples) > 0) {
+  keep_samples <- setdiff(colnames(otu_mat), zero_samples)
+  otu_mat <- otu_mat[, keep_samples, drop = FALSE]
+  meta <- meta %>% filter(SampleID %in% keep_samples)
+}
+otu_mat <- otu_mat[rowSums(otu_mat) > 0, , drop = FALSE]
+if (nrow(otu_mat) < 2L || ncol(otu_mat) == 0L) {
+  stop("Insufficient taxa or samples remain after basic QC.")
+}
+```
+
+## 5. Freeze relative-abundance denominator BEFORE prevalence filtering
+
+```{r freeze-ra-denominator}
+base_library_size <- colSums(otu_mat)
+if (any(base_library_size <= 0)) stop("Zero-library sample remains after basic QC.")
+
+otu_rel_all <- sweep(otu_mat, 2, base_library_size, "/")
+if (any(abs(colSums(otu_rel_all) - 1) > 1e-8)) {
+  stop("Relative-abundance calculation failed: sample sums are not 1.")
+}
+
+write.csv(
+  data.frame(TaxonID = rownames(otu_rel_all), otu_rel_all, check.names = FALSE),
+  file.path(OUT_DIR, "00_BZ_EZ_relative_abundance_before_prevalence_filter.csv"),
+  row.names = FALSE
+)
+
+min_nonzero_relative_abundance <- min(otu_rel_all[otu_rel_all > 0], na.rm = TRUE)
+RATIO_PSEUDOCOUNT <- RATIO_PSEUDOCOUNT_MULTIPLIER * min_nonzero_relative_abundance
+```
+
+## 6. Stage × Season prevalence filtering FIRST
+
+```{r prevalence-filter}
+stage_prev_long <- bind_rows(lapply(ANALYSIS_TYPES, function(st) {
+  bind_rows(lapply(SEASON_LEVELS, function(se) {
+    stage_season_prevalence(otu_mat, meta, st, se, PREVALENCE_CUT_PRIMARY)
+  }))
+})) %>%
+  mutate(
+    StageSeason = paste(Stage, Season, sep = "_"),
+    StageSeason = factor(
+      StageSeason,
+      levels = as.vector(outer(ANALYSIS_TYPES, SEASON_LEVELS, paste, sep = "_"))
+    )
+  )
+
+retained_summary <- stage_prev_long %>%
+  group_by(TaxonID) %>%
+  summarise(
+    NStageSeasonGroupsObserved = sum(NSamplesStageSeason > 0),
+    NStageSeasonGroupsPassing = sum(KeepStageSeason, na.rm = TRUE),
+    MaxStageSeasonPrevalence = if (all(is.na(Prevalence))) NA_real_ else max(Prevalence, na.rm = TRUE),
+    RetainedByStageSeasonUnion = any(KeepStageSeason %in% TRUE),
+    .groups = "drop"
+  )
+
+stage_prev_wide <- stage_prev_long %>%
+  mutate(StageSeason = as.character(StageSeason)) %>%
+  select(TaxonID, StageSeason, NSamplesStageSeason, DetectedN,
+         Prevalence, RequiredDetectedN, KeepStageSeason) %>%
+  pivot_wider(
+    names_from = StageSeason,
+    values_from = c(NSamplesStageSeason, DetectedN, Prevalence,
+                    RequiredDetectedN, KeepStageSeason),
+    names_glue = "{StageSeason}_{.value}"
+  ) %>%
+  left_join(retained_summary, by = "TaxonID")
+
+write.csv(stage_prev_wide,
+          file.path(OUT_DIR, "01_BZ_EZ_StageSeason_prevalence_filter.csv"),
+          row.names = FALSE)
+
+BZ_EZ_TAXA <- retained_summary %>%
+  filter(RetainedByStageSeasonUnion) %>%
+  pull(TaxonID) %>%
+  intersect(rownames(otu_mat))
+
+if (length(BZ_EZ_TAXA) == 0) stop("No taxa remain after Stage × Season prevalence union filtering.")
+```
+
+## 7. Comparison-specific complete matched BZ–EZ Cycle contexts
+
+```{r matched-contexts}
+context_coverage <- meta %>%
+  mutate(Stage = factor(as.character(Stage), levels = ANALYSIS_TYPES)) %>%
+  count(BrewingCycle, Season, Park, Stage, name = "NBioRep") %>%
+  tidyr::complete(BrewingCycle, Season, Park, Stage, fill = list(NBioRep = 0)) %>%
+  pivot_wider(names_from = Stage, values_from = NBioRep, values_fill = 0) %>%
+  mutate(
+    BZ_EZ_Eligible = BZ == EXPECTED_N_BIOREP & EZ == EXPECTED_N_BIOREP,
+    BrewingGroupID = paste(as.character(BrewingCycle), as.character(Season),
+                            as.character(Park), sep = "_")
+  )
+
+write.csv(context_coverage,
+          file.path(OUT_DIR, "00_QC_BZ_EZ_Cycle_context_coverage.csv"),
+          row.names = FALSE)
+
+eligible_groups <- context_coverage %>%
+  filter(BZ_EZ_Eligible) %>%
+  pull(BrewingGroupID) %>% as.character()
+
+if (length(eligible_groups) < 2) stop("Too few complete matched BZ–EZ Cycle contexts.")
+
+analysis_meta <- meta %>%
+  filter(BrewingGroupID %in% eligible_groups) %>%
+  mutate(
+    Stage = factor(as.character(Stage), levels = ANALYSIS_TYPES),
+    BrewingCycle = factor(as.character(BrewingCycle), levels = CORE_CYCLES),
+    Season = factor(as.character(Season), levels = SEASON_LEVELS),
+    Park = factor(as.character(Park), levels = EXPECTED_PARKS),
+    BrewingGroupID = factor(BrewingGroupID)
+  )
+
+## Park × Season coverage after allowing one or two eligible cycles per cell.
+park_season_coverage <- context_coverage %>%
+  filter(BZ_EZ_Eligible) %>%
+  group_by(Season, Park) %>%
+  summarise(
+    NEligibleCycles = n_distinct(BrewingCycle),
+    EligibleCycles = paste(sort(unique(as.character(BrewingCycle))), collapse = ";"),
+    .groups = "drop"
+  ) %>%
+  tidyr::complete(
+    Season = factor(SEASON_LEVELS, levels = SEASON_LEVELS),
+    Park = factor(EXPECTED_PARKS, levels = EXPECTED_PARKS),
+    fill = list(NEligibleCycles = 0L, EligibleCycles = "")
+  ) %>%
+  mutate(ParkSeasonObserved = NEligibleCycles >= 1)
+
+write.csv(park_season_coverage,
+          file.path(OUT_DIR, "00_QC_BZ_EZ_ParkSeason_coverage.csv"),
+          row.names = FALSE)
+```
+
+## 8. One global ANCOM-BC2 model at individual-sample level
+
+```{r ancombc2}
+run_global_ancombc2 <- function(count_mat, meta_df, taxa_keep) {
+  if (!RUN_ANCOMBC2) {
+    return(tibble(
+      TaxonID = taxa_keep,
+      ANCOM_LFC_ln = NA_real_, ANCOM_P = NA_real_, ANCOM_Q = NA_real_,
+      ANCOM_Diff = NA, ANCOM_PassedSS = NA, ANCOM_DiffRobust = NA,
+      ANCOM_StructuralZero = FALSE, ANCOM_StructuralDirection = NA_character_,
+      ANCOMDirection = NA_character_, ANCOMStatLevel = "Not_tested",
+      ANCOM_RobustSupported = FALSE, ANCOM_FDRNonrobust = FALSE
+    ))
+  }
+
+  taxa_keep <- intersect(taxa_keep, rownames(count_mat))
+  cm <- count_mat[taxa_keep, meta_df$SampleID, drop = FALSE]
+  cm <- cm[rowSums(cm) > 0, , drop = FALSE]
+  if (nrow(cm) < 2L || any(colSums(cm) <= 0)) {
+    stop("ANCOM-BC2 requires at least two retained taxa and nonzero sample libraries.")
+  }
+
+  md <- as.data.frame(meta_df)
+  rownames(md) <- md$SampleID
+
+  tse <- TreeSummarizedExperiment::TreeSummarizedExperiment(
+    assays = S4Vectors::SimpleList(counts = cm),
+    colData = S4Vectors::DataFrame(md)
+  )
+
+  out <- ANCOMBC::ancombc2(
+    data = tse,
+    assay_name = "counts",
+    tax_level = NULL,
+    fix_formula = "BrewingGroupID + Stage",
+    rand_formula = NULL,
+    p_adj_method = ANCOM_P_ADJ_METHOD,
+    pseudo_sens = ANCOM_PSEUDO_SENS,
+    prv_cut = ANCOM_PRV_CUT,
+    lib_cut = 0,
+    s0_perc = 0.05,
+    group = "Stage",
+    struc_zero = TRUE,
+    neg_lb = ANCOM_NEG_LB,
+    alpha = FDR_CUTOFF,
+    n_cl = ANCOM_N_CL,
+    verbose = FALSE,
+    global = FALSE,
+    pairwise = FALSE,
+    dunnet = FALSE,
+    trend = FALSE,
+    iter_control = list(tol = 1e-2, max_iter = 20, verbose = FALSE),
+    em_control = list(tol = 1e-5, max_iter = 100)
+  )
+
+  raw_res <- as.data.frame(out$res, check.names = FALSE)
+  lfc_cols <- grep("^lfc_Stage", names(raw_res), value = TRUE)
+  if (length(lfc_cols) == 0) stop("Could not identify the ANCOM-BC2 Stage coefficient.")
+
+  lfc_col <- lfc_cols[grepl("EZ", lfc_cols, fixed = TRUE)]
+  if (length(lfc_col) == 0) lfc_col <- lfc_cols[1]
+  lfc_col <- lfc_col[1]
+  suffix <- sub("^lfc_", "", lfc_col)
+
+  get_col <- function(prefix) {
+    z <- paste0(prefix, "_", suffix)
+    if (z %in% names(raw_res)) z else NA_character_
+  }
+
+  p_col <- get_col("p")
+  q_col <- get_col("q")
+  diff_col <- get_col("diff")
+  ss_col <- get_col("passed_ss")
+  robust_col <- get_col("diff_robust")
+
+  taxon_values <- if ("taxon" %in% names(raw_res)) as.character(raw_res$taxon) else rownames(raw_res)
+
+  primary <- tibble(
+    TaxonID = taxon_values,
+    ANCOM_LFC_ln = as.numeric(raw_res[[lfc_col]]),
+    ANCOM_P = if (!is.na(p_col)) as.numeric(raw_res[[p_col]]) else NA_real_,
+    ANCOM_Q = if (!is.na(q_col)) as.numeric(raw_res[[q_col]]) else NA_real_,
+    ANCOM_Diff = if (!is.na(diff_col)) as.logical(raw_res[[diff_col]]) else NA,
+    ANCOM_PassedSS = if (!is.na(ss_col)) as.logical(raw_res[[ss_col]]) else NA,
+    ANCOM_DiffRobust = if (!is.na(robust_col)) {
+      as.logical(raw_res[[robust_col]])
+    } else if (!is.na(diff_col) && !is.na(ss_col)) {
+      as.logical(raw_res[[diff_col]]) & as.logical(raw_res[[ss_col]])
+    } else NA,
+    ANCOM_StructuralZero = FALSE,
+    ANCOM_StructuralDirection = NA_character_
+  )
+
+  ## Structural-zero taxa can be absent from out$res. Keep the full modeled
+  ## taxon universe before merging their separate presence/absence evidence.
+  primary <- tibble(TaxonID = rownames(cm)) %>%
+    left_join(primary, by = "TaxonID") %>%
+    mutate(ANCOM_StructuralZero = coalesce(ANCOM_StructuralZero, FALSE))
+
+  if (!is.null(out$zero_ind)) {
+    zr <- as.data.frame(out$zero_ind, check.names = FALSE)
+    if (!("taxon" %in% names(zr))) zr <- tibble::rownames_to_column(zr, "taxon")
+
+    pick_stage_col <- function(stage_name) {
+      z_names <- setdiff(names(zr), "taxon")
+      exact <- z_names[z_names == stage_name]
+      if (length(exact) > 0) return(exact[1])
+      hit <- z_names[grepl(stage_name, z_names, fixed = TRUE)]
+      if (length(hit) == 1) return(hit[1])
+      NA_character_
+    }
+
+    bz_col <- pick_stage_col("BZ")
+    ez_col <- pick_stage_col("EZ")
+
+    if (!is.na(bz_col) && !is.na(ez_col)) {
+      zero_summary <- tibble(
+        TaxonID = as.character(zr$taxon),
+        BZ_StructuralZero = as.logical(zr[[bz_col]]),
+        EZ_StructuralZero = as.logical(zr[[ez_col]])
+      ) %>%
+        filter(BZ_StructuralZero %in% TRUE | EZ_StructuralZero %in% TRUE) %>%
+        transmute(
+          TaxonID,
+          ANCOM_StructuralZero_new = TRUE,
+          ANCOM_StructuralDirection_new = case_when(
+            BZ_StructuralZero %in% TRUE & !(EZ_StructuralZero %in% TRUE) ~
+              "EZ_enriched_presence_absence",
+            EZ_StructuralZero %in% TRUE & !(BZ_StructuralZero %in% TRUE) ~
+              "EZ_depleted_presence_absence",
+            TRUE ~ "Ambiguous_structural_zero"
+          )
+        )
+
+      primary <- primary %>%
+        left_join(zero_summary, by = "TaxonID") %>%
+        mutate(
+          ANCOM_StructuralZero = coalesce(ANCOM_StructuralZero_new, ANCOM_StructuralZero),
+          ANCOM_StructuralDirection = coalesce(ANCOM_StructuralDirection_new,
+                                               ANCOM_StructuralDirection)
+        ) %>%
+        select(-ANCOM_StructuralZero_new, -ANCOM_StructuralDirection_new)
+    }
+  }
+
+  primary %>%
+    mutate(
+      ANCOMDirection = case_when(
+        ANCOM_StructuralZero %in% TRUE &
+          ANCOM_StructuralDirection == "EZ_enriched_presence_absence" ~ "Up",
+        ANCOM_StructuralZero %in% TRUE &
+          ANCOM_StructuralDirection == "EZ_depleted_presence_absence" ~ "Down",
+        ANCOM_StructuralZero %in% TRUE ~ "Ambiguous",
+        !is.na(ANCOM_LFC_ln) & ANCOM_LFC_ln > 0 ~ "Up",
+        !is.na(ANCOM_LFC_ln) & ANCOM_LFC_ln < 0 ~ "Down",
+        !is.na(ANCOM_LFC_ln) ~ "Zero",
+        TRUE ~ NA_character_
+      ),
+      ANCOMStatLevel = case_when(
+        ANCOM_StructuralZero %in% TRUE &
+          ANCOM_StructuralDirection != "Ambiguous_structural_zero" ~
+          "Structural_zero_supported",
+        ANCOM_DiffRobust %in% TRUE ~ "ANCOMBC2_robust",
+        ANCOM_Diff %in% TRUE ~ "ANCOMBC2_FDR_supported_nonrobust",
+        TRUE ~ "Not_supported"
+      ),
+      ANCOM_RobustSupported =
+        (ANCOM_StructuralZero %in% TRUE &
+           ANCOM_StructuralDirection != "Ambiguous_structural_zero") |
+        ANCOM_DiffRobust %in% TRUE,
+      ANCOM_FDRNonrobust =
+        !(ANCOM_RobustSupported %in% TRUE) & ANCOM_Diff %in% TRUE
+    )
+}
+
+ancom_global <- tryCatch(
+  run_global_ancombc2(otu_mat, analysis_meta, BZ_EZ_TAXA),
+  error = function(e) stop("Global ANCOM-BC2 failed: ", conditionMessage(e))
+)
+
+write.csv(ancom_global,
+          file.path(OUT_DIR, "03_ANCOMBC2_global_BZ_EZ_stage_effect.csv"),
+          row.names = FALSE)
+```
+
+## 9. Relative-abundance data for matched comparison contexts
+
+```{r relative-abundance-long}
+rel_analysis <- otu_rel_all[BZ_EZ_TAXA, analysis_meta$SampleID, drop = FALSE]
+
+rel_long_analysis <- as.data.frame(t(rel_analysis), check.names = FALSE) %>%
+  rownames_to_column("SampleID") %>% as_tibble() %>%
+  pivot_longer(cols = -SampleID, names_to = "TaxonID", values_to = "RelAbund") %>%
+  left_join(analysis_meta, by = "SampleID") %>%
+  mutate(Present = RelAbund > 0)
+```
+
+## 10. Descriptive hierarchy: median only
+
+```{r descriptive-median}
+build_descriptive_pipeline <- function() {
+
+  ## 10A. Biological replicates -> Cycle context
+  context_stage <- rel_long_analysis %>%
+    group_by(BrewingCycle, Season, Park, BrewingGroupID, Stage, TaxonID) %>%
+    summarise(
+      ContextAbundance = summary_value(RelAbund),
+      ReplicatePrevalence = mean(Present, na.rm = TRUE),
+      NBioRep = n(),
+      .groups = "drop"
+    )
+
+  context_effects <- context_stage %>%
+    mutate(Stage = as.character(Stage)) %>%
+    pivot_wider(
+      id_cols = c(BrewingCycle, Season, Park, BrewingGroupID, TaxonID),
+      names_from = Stage,
+      values_from = c(ContextAbundance, ReplicatePrevalence, NBioRep),
+      names_glue = "{.value}_{Stage}"
+    ) %>%
+    filter(NBioRep_BZ == EXPECTED_N_BIOREP,
+           NBioRep_EZ == EXPECTED_N_BIOREP) %>%
+    mutate(
+      SummaryMethod = SUMMARY_METHOD,
+      ContextLog2Ratio = safe_ratio(ContextAbundance_EZ,
+                                    ContextAbundance_BZ,
+                                    RATIO_PSEUDOCOUNT),
+      ContextSign = sign_class(ContextLog2Ratio),
+      ContextStrongClass = strong_response_class(ContextLog2Ratio),
+      ContextPresent_BZ = ReplicatePrevalence_BZ >= MIN_REP_PREV,
+      ContextPresent_EZ = ReplicatePrevalence_EZ >= MIN_REP_PREV
+    )
+
+  ## 10B. Cycle context -> Park × Season, using all AVAILABLE eligible cycles.
+  park_season_effects <- context_effects %>%
+    group_by(Season, Park, TaxonID) %>%
+    summarise(
+      ParkSeasonNContexts = n(),
+      ParkSeasonNCycles = n_distinct(BrewingCycle),
+      ParkSeasonCycles = paste(sort(unique(as.character(BrewingCycle))), collapse = ";"),
+      ParkSeasonAbundance_BZ = summary_value(ContextAbundance_BZ),
+      ParkSeasonAbundance_EZ = summary_value(ContextAbundance_EZ),
+      ParkSeasonPresence_BZ = mean(ContextPresent_BZ, na.rm = TRUE),
+      ParkSeasonPresence_EZ = mean(ContextPresent_EZ, na.rm = TRUE),
+      ParkSeasonLog2Ratio = summary_value(ContextLog2Ratio),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      SummaryMethod = SUMMARY_METHOD,
+      ParkSeasonSign = sign_class(ParkSeasonLog2Ratio),
+      ParkSeasonStrongClass = strong_response_class(ParkSeasonLog2Ratio)
+    )
+
+  ## 10C. Park × Season -> Season (three parks are equal-weight units).
+  season_effects <- park_season_effects %>%
+    group_by(Season, TaxonID) %>%
+    summarise(
+      SeasonNParkSeasonCells = n(),
+      SeasonNParks = n_distinct(Park),
+      SeasonAbundance_BZ = summary_value(ParkSeasonAbundance_BZ),
+      SeasonAbundance_EZ = summary_value(ParkSeasonAbundance_EZ),
+      SeasonPresence_BZ = mean(ParkSeasonPresence_BZ >= MIN_UNIT_PREV, na.rm = TRUE),
+      SeasonPresence_EZ = mean(ParkSeasonPresence_EZ >= MIN_UNIT_PREV, na.rm = TRUE),
+      SeasonLog2Ratio = summary_value(ParkSeasonLog2Ratio),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      SummaryMethod = SUMMARY_METHOD,
+      SeasonSign = sign_class(SeasonLog2Ratio),
+      SeasonStrongClass = strong_response_class(SeasonLog2Ratio)
+    )
+
+  ## 10D. Park × Season -> Park (four seasons are equal-weight units).
+  park_effects <- park_season_effects %>%
+    group_by(Park, TaxonID) %>%
+    summarise(
+      ParkNParkSeasonCells = n(),
+      ParkNSeasons = n_distinct(Season),
+      ParkAbundance_BZ = summary_value(ParkSeasonAbundance_BZ),
+      ParkAbundance_EZ = summary_value(ParkSeasonAbundance_EZ),
+      ParkPresence_BZ = mean(ParkSeasonPresence_BZ >= MIN_UNIT_PREV, na.rm = TRUE),
+      ParkPresence_EZ = mean(ParkSeasonPresence_EZ >= MIN_UNIT_PREV, na.rm = TRUE),
+      ParkLog2Ratio = summary_value(ParkSeasonLog2Ratio),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      SummaryMethod = SUMMARY_METHOD,
+      ParkSign = sign_class(ParkLog2Ratio),
+      ParkStrongClass = strong_response_class(ParkLog2Ratio)
+    )
+
+  ## 10E. Season / Park -> Overall.
+  ## Primary Overall is obtained from the four Season summaries so that the
+  ## four seasons are equal-weight terminal units. A parallel Park-path
+  ## Overall is also reported as a diagnostic check. Both paths have already
+  ## passed through Cycle context -> Park × Season first.
+  coverage_summary <- park_season_effects %>%
+    group_by(TaxonID) %>%
+    summarise(
+      NParkSeasonAvailable = n(),
+      NSeasonsAvailable = n_distinct(Season),
+      NParksAvailable = n_distinct(Park),
+      NParkSeasonCellsWithTwoCycles = sum(ParkSeasonNCycles >= 2),
+      NParkSeasonCellsWithOneCycle = sum(ParkSeasonNCycles == 1),
+      NParkSeasonUp = sum(ParkSeasonSign == "Up", na.rm = TRUE),
+      NParkSeasonDown = sum(ParkSeasonSign == "Down", na.rm = TRUE),
+      NParkSeasonZero = sum(ParkSeasonSign == "Zero", na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  overall_by_season <- season_effects %>%
+    group_by(TaxonID) %>%
+    summarise(
+      OverallAbundance_BZ = summary_value(SeasonAbundance_BZ),
+      OverallAbundance_EZ = summary_value(SeasonAbundance_EZ),
+      BZ_SeasonPrevalence = mean(SeasonPresence_BZ >= MIN_UNIT_PREV, na.rm = TRUE),
+      EZ_SeasonPrevalence = mean(SeasonPresence_EZ >= MIN_UNIT_PREV, na.rm = TRUE),
+      OverallLog2Ratio = summary_value(SeasonLog2Ratio),
+      .groups = "drop"
+    )
+
+  overall_by_park <- park_effects %>%
+    group_by(TaxonID) %>%
+    summarise(
+      OverallLog2Ratio_ParkPath = summary_value(ParkLog2Ratio),
+      .groups = "drop"
+    )
+
+  overall_desc <- coverage_summary %>%
+    left_join(overall_by_season, by = "TaxonID") %>%
+    left_join(overall_by_park, by = "TaxonID") %>%
+    mutate(
+      SummaryMethod = SUMMARY_METHOD,
+      OverallDirection = sign_class(OverallLog2Ratio),
+      OverallDirection_ParkPath = sign_class(OverallLog2Ratio_ParkPath),
+      OverallSeasonParkPathDirectionAgreement =
+        OverallDirection == OverallDirection_ParkPath,
+      Full12ParkSeasonCoverage =
+        NParkSeasonAvailable == length(SEASON_LEVELS) * length(EXPECTED_PARKS),
+      AllAvailableParkSeasonSameDirection = case_when(
+        NParkSeasonAvailable > 0 & NParkSeasonUp == NParkSeasonAvailable ~ TRUE,
+        NParkSeasonAvailable > 0 & NParkSeasonDown == NParkSeasonAvailable ~ TRUE,
+        TRUE ~ FALSE
+      ),
+      ParkSeasonDirection = case_when(
+        NParkSeasonAvailable > 0 & NParkSeasonUp == NParkSeasonAvailable ~ "Up",
+        NParkSeasonAvailable > 0 & NParkSeasonDown == NParkSeasonAvailable ~ "Down",
+        TRUE ~ "Mixed"
+      ),
+      All12ParkSeasonSameDirection =
+        Full12ParkSeasonCoverage & AllAvailableParkSeasonSameDirection,
+      BZ_HighState = OverallAbundance_BZ >= HIGH_ABUND &
+        BZ_SeasonPrevalence >= MIN_UNIT_PREV,
+      EZ_HighState = OverallAbundance_EZ >= HIGH_ABUND &
+        EZ_SeasonPrevalence >= MIN_UNIT_PREV
+    )
+
+  season_summary <- season_effects %>%
+    group_by(TaxonID) %>%
+    summarise(
+      NSeasonsAvailable = n_distinct(Season),
+      NSeasonsUp = sum(SeasonSign == "Up", na.rm = TRUE),
+      NSeasonsDown = sum(SeasonSign == "Down", na.rm = TRUE),
+      NSeasonStrongUp = sum(SeasonStrongClass == "Up_2fold_or_more", na.rm = TRUE),
+      NSeasonStrongDown = sum(SeasonStrongClass == "Down_2fold_or_more", na.rm = TRUE),
+      StrongUpSeasons = paste(as.character(Season[SeasonStrongClass == "Up_2fold_or_more"]),
+                              collapse = ";"),
+      StrongDownSeasons = paste(as.character(Season[SeasonStrongClass == "Down_2fold_or_more"]),
+                                collapse = ";"),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      FourSeasonSameDirection =
+        NSeasonsAvailable == length(SEASON_LEVELS) &
+        (NSeasonsUp == length(SEASON_LEVELS) |
+           NSeasonsDown == length(SEASON_LEVELS)),
+      SeasonDirection = case_when(
+        NSeasonsAvailable == length(SEASON_LEVELS) &
+          NSeasonsUp == length(SEASON_LEVELS) ~ "Up",
+        NSeasonsAvailable == length(SEASON_LEVELS) &
+          NSeasonsDown == length(SEASON_LEVELS) ~ "Down",
+        TRUE ~ "Mixed"
+      ),
+      FourSeasonAllAtLeast2Fold =
+        FourSeasonSameDirection &
+        ((SeasonDirection == "Up" & NSeasonStrongUp == length(SEASON_LEVELS)) |
+           (SeasonDirection == "Down" & NSeasonStrongDown == length(SEASON_LEVELS)))
+    )
+
+  park_summary <- park_effects %>%
+    group_by(TaxonID) %>%
+    summarise(
+      NParksAvailable = n_distinct(Park),
+      NParksUp = sum(ParkSign == "Up", na.rm = TRUE),
+      NParksDown = sum(ParkSign == "Down", na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      ThreeParkSameDirection =
+        NParksAvailable == length(EXPECTED_PARKS) &
+        (NParksUp == length(EXPECTED_PARKS) |
+           NParksDown == length(EXPECTED_PARKS)),
+      ParkDirection = case_when(
+        NParksAvailable == length(EXPECTED_PARKS) &
+          NParksUp == length(EXPECTED_PARKS) ~ "Up",
+        NParksAvailable == length(EXPECTED_PARKS) &
+          NParksDown == length(EXPECTED_PARKS) ~ "Down",
+        TRUE ~ "Mixed"
+      )
+    )
+
+  park_season_matrix <- park_season_effects %>%
+    mutate(
+      Season = as.character(Season),
+      Park = as.character(Park),
+      ParkSeason = paste(Season, Park, sep = "_")
+    ) %>%
+    select(TaxonID, ParkSeason, ParkSeasonLog2Ratio,
+           ParkSeasonNContexts, ParkSeasonNCycles) %>%
+    pivot_wider(
+      names_from = ParkSeason,
+      values_from = c(ParkSeasonLog2Ratio, ParkSeasonNContexts, ParkSeasonNCycles),
+      names_glue = "{.value}_{ParkSeason}"
+    )
+
+  season_matrix <- season_effects %>%
+    mutate(Season = as.character(Season)) %>%
+    select(TaxonID, Season, SeasonLog2Ratio) %>%
+    pivot_wider(names_from = Season, values_from = SeasonLog2Ratio,
+                names_prefix = "SeasonLog2_")
+
+  park_matrix <- park_effects %>%
+    mutate(Park = as.character(Park)) %>%
+    select(TaxonID, Park, ParkLog2Ratio) %>%
+    pivot_wider(names_from = Park, values_from = ParkLog2Ratio,
+                names_prefix = "ParkLog2_")
+
+  list(
+    context_effects = context_effects,
+    park_season_effects = park_season_effects,
+    season_effects = season_effects,
+    park_effects = park_effects,
+    overall_desc = overall_desc,
+    season_summary = season_summary,
+    park_summary = park_summary,
+    park_season_matrix = park_season_matrix,
+    season_matrix = season_matrix,
+    park_matrix = park_matrix
+  )
+}
+```
+
+## 11. DeltaCLR heterogeneity: median-based context summaries
+
+```{r delta-clr-heterogeneity}
+build_heterogeneity <- function() {
+  context_clr <- build_context_clr(
+    count_mat = otu_mat,
+    meta_df = analysis_meta,
+    taxa_ids = BZ_EZ_TAXA,
+    sample_ids = analysis_meta$SampleID
+  )
+
+  delta_clr <- context_clr %>%
+    mutate(Stage = as.character(Stage)) %>%
+    pivot_wider(
+      id_cols = c(BrewingCycle, Season, Park, BrewingGroupID, TaxonID),
+      names_from = Stage,
+      values_from = c(CLR, NBioRep),
+      names_glue = "{.value}_{Stage}"
+    ) %>%
+    filter(NBioRep_BZ == EXPECTED_N_BIOREP,
+           NBioRep_EZ == EXPECTED_N_BIOREP) %>%
+    mutate(
+      DeltaCLR = CLR_EZ - CLR_BZ,
+      BrewingCycle = factor(as.character(BrewingCycle), levels = CORE_CYCLES),
+      Season = factor(as.character(Season), levels = SEASON_LEVELS),
+      Park = factor(as.character(Park), levels = EXPECTED_PARKS)
+    )
+
+  season_heterogeneity <- delta_clr %>%
+    group_by(TaxonID) %>%
+    group_modify(~{
+      p <- factor_block_p_available(
+        .x, response = "DeltaCLR", target_factor = "Season",
+        covariates = c("Park", "BrewingCycle")
+      )
+      tibble(SeasonHeterogeneityP = p)
+    }) %>%
+    ungroup() %>%
+    mutate(
+      SeasonHeterogeneityQ = p.adjust(SeasonHeterogeneityP, method = "BH"),
+      SeasonHeterogeneityTestable = !is.na(SeasonHeterogeneityQ),
+      SeasonHeterogeneityDetected = SeasonHeterogeneityTestable &
+        SeasonHeterogeneityQ < FDR_CUTOFF
+    )
+
+  park_heterogeneity <- delta_clr %>%
+    group_by(TaxonID) %>%
+    group_modify(~{
+      p <- factor_block_p_available(
+        .x, response = "DeltaCLR", target_factor = "Park",
+        covariates = c("Season", "BrewingCycle")
+      )
+      tibble(ParkHeterogeneityP = p)
+    }) %>%
+    ungroup() %>%
+    mutate(
+      ParkHeterogeneityQ = p.adjust(ParkHeterogeneityP, method = "BH"),
+      ParkHeterogeneityTestable = !is.na(ParkHeterogeneityQ),
+      ParkHeterogeneityDetected = ParkHeterogeneityTestable &
+        ParkHeterogeneityQ < FDR_CUTOFF
+    )
+
+  list(
+    delta_clr = delta_clr,
+    season = season_heterogeneity,
+    park = park_heterogeneity
+  )
+}
+```
+
+## 12. Optional taxonomy
+
+```{r taxonomy}
+tax <- NULL
+if (nzchar(TAX_FILE) && file.exists(TAX_FILE)) {
+  tax <- read_auto(TAX_FILE, TAX_SHEET)
+  names(tax)[1] <- "TaxonID"
+  tax$TaxonID <- as.character(tax$TaxonID)
+  if (anyDuplicated(tax$TaxonID)) stop("Taxonomy file contains duplicated TaxonID values.")
+}
+```
+
+## 13. Integrate median descriptive results with the SAME ANCOM-BC2 result
+
+```{r integrate-results}
+integrate_results <- function(desc, hetero) {
+  integrated <- desc$overall_desc %>%
+    left_join(ancom_global, by = "TaxonID") %>%
+    left_join(desc$season_summary, by = c("TaxonID", "NSeasonsAvailable")) %>%
+    left_join(desc$park_summary, by = c("TaxonID", "NParksAvailable")) %>%
+    left_join(desc$season_matrix, by = "TaxonID") %>%
+    left_join(desc$park_matrix, by = "TaxonID") %>%
+    left_join(hetero$season, by = "TaxonID") %>%
+    left_join(hetero$park, by = "TaxonID") %>%
+    mutate(
+      ANCOMDirectionMatchesOverall =
+        ANCOMDirection %in% c("Up", "Down") &
+        OverallDirection == ANCOMDirection,
+
+      ParkSeasonDirectionMatchesOverall =
+        AllAvailableParkSeasonSameDirection &
+        ParkSeasonDirection == OverallDirection,
+
+      SeasonDirectionMatchesOverall =
+        FourSeasonSameDirection &
+        SeasonDirection == OverallDirection,
+
+      ParkDirectionMatchesOverall =
+        ThreeParkSameDirection &
+        ParkDirection == OverallDirection,
+
+      ## This is the only descriptive + inferential Stage-response gate.
+      ## Nonrobust ANCOM results can never satisfy GlobalResponseRobust.
+      GlobalResponseRobust =
+        ANCOM_RobustSupported %in% TRUE &
+        ANCOMDirectionMatchesOverall %in% TRUE &
+        abs(OverallLog2Ratio) >= LFC_RESPONSE,
+
+      GlobalResponseRobustClass = case_when(
+        GlobalResponseRobust & OverallDirection == "Up" ~ "EZ_enriched",
+        GlobalResponseRobust & OverallDirection == "Down" ~ "EZ_depleted",
+        TRUE ~ "No_robust_stage_response"
+      ),
+
+      PersistentCandidate =
+        RUN_ANCOMBC2 & is.finite(ANCOM_Q) &
+        !(ANCOM_RobustSupported %in% TRUE) &
+        !(ANCOM_Diff %in% TRUE) &
+        BZ_HighState & EZ_HighState &
+        abs(OverallLog2Ratio) <= LFC_PERSISTENT_MAX,
+
+      ParkConsistencyLevel = case_when(
+        All12ParkSeasonSameDirection &
+          ParkHeterogeneityTestable &
+          !ParkHeterogeneityDetected ~
+          "12cell_direction_consistent_no_detected_park_heterogeneity",
+
+        All12ParkSeasonSameDirection &
+          ParkHeterogeneityDetected ~
+          "12cell_direction_consistent_but_park_magnitude_heterogeneous",
+
+        All12ParkSeasonSameDirection &
+          !ParkHeterogeneityTestable ~
+          "12cell_direction_consistent_park_heterogeneity_not_testable",
+
+        !Full12ParkSeasonCoverage & AllAvailableParkSeasonSameDirection ~
+          "available_cells_direction_consistent_but_incomplete_12cell_coverage",
+
+        TRUE ~ "mixed_ParkSeason_direction"
+      ),
+
+      FinalEvidenceLevel = case_when(
+        GlobalResponseRobust &
+          Full12ParkSeasonCoverage &
+          All12ParkSeasonSameDirection &
+          ParkSeasonDirectionMatchesOverall &
+          FourSeasonAllAtLeast2Fold &
+          SeasonDirectionMatchesOverall ~
+          "Core_4season_2fold_3park",
+
+        GlobalResponseRobust &
+          Full12ParkSeasonCoverage &
+          All12ParkSeasonSameDirection &
+          ParkSeasonDirectionMatchesOverall &
+          FourSeasonSameDirection &
+          SeasonDirectionMatchesOverall ~
+          "Core_4season_direction_3park",
+
+        GlobalResponseRobust &
+          !Full12ParkSeasonCoverage &
+          AllAvailableParkSeasonSameDirection &
+          ParkSeasonDirectionMatchesOverall ~
+          "Robust_recurrent_incomplete_12cell_coverage",
+
+        GlobalResponseRobust ~
+          "Global_robust_stage_response",
+
+        ANCOM_RobustSupported %in% TRUE ~
+          "ANCOMBC2_robust_below_2fold_or_direction_mismatch",
+
+        ANCOM_FDRNonrobust %in% TRUE ~
+          "FDR_supported_nonrobust",
+
+        PersistentCandidate ~
+          "Persistent_candidate",
+
+        TRUE ~ "Exploratory"
+      )
+    ) %>%
+    left_join(
+      retained_summary %>%
+        select(TaxonID, NStageSeasonGroupsObserved, NStageSeasonGroupsPassing,
+               MaxStageSeasonPrevalence, RetainedByStageSeasonUnion),
+      by = "TaxonID"
+    )
+
+  if (!is.null(tax)) integrated <- integrated %>% left_join(tax, by = "TaxonID")
+
+  integrated %>%
+    arrange(
+      factor(
+        FinalEvidenceLevel,
+        levels = c(
+          "Core_4season_2fold_3park",
+          "Core_4season_direction_3park",
+          "Robust_recurrent_incomplete_12cell_coverage",
+          "Global_robust_stage_response",
+          "ANCOMBC2_robust_below_2fold_or_direction_mismatch",
+          "FDR_supported_nonrobust",
+          "Persistent_candidate",
+          "Exploratory"
+        )
+      ),
+      desc(abs(OverallLog2Ratio))
+    )
+}
+```
+
+## 14. Stage-specific core ASVs: auxiliary median-only output
+
+```{r stage-core}
+build_stage_core <- function() {
+  stage_context_complete <- meta %>%
+    mutate(Stage = factor(as.character(Stage), levels = ANALYSIS_TYPES)) %>%
+    count(BrewingCycle, Season, Park, Stage, name = "NBioRep") %>%
+    filter(NBioRep == EXPECTED_N_BIOREP) %>%
+    select(BrewingCycle, Season, Park, Stage)
+
+  core_sample_ids <- meta %>%
+    semi_join(stage_context_complete,
+              by = c("BrewingCycle", "Season", "Park", "Stage")) %>%
+    pull(SampleID) %>% as.character()
+
+  core_rel_long <- as.data.frame(
+    t(otu_rel_all[BZ_EZ_TAXA, core_sample_ids, drop = FALSE]),
+    check.names = FALSE
+  ) %>%
+    rownames_to_column("SampleID") %>% as_tibble() %>%
+    pivot_longer(cols = -SampleID, names_to = "TaxonID", values_to = "RelAbund") %>%
+    left_join(meta, by = "SampleID") %>%
+    mutate(Present = RelAbund > 0) %>%
+    group_by(BrewingCycle, Season, Park, Stage, TaxonID) %>%
+    summarise(
+      ContextAbundance = summary_value(RelAbund),
+      ReplicatePrevalence = mean(Present, na.rm = TRUE),
+      NBioRep = n(),
+      .groups = "drop"
+    ) %>%
+    inner_join(stage_context_complete,
+               by = c("BrewingCycle", "Season", "Park", "Stage")) %>%
+    mutate(ContextPresent = ReplicatePrevalence >= MIN_REP_PREV)
+
+  core_stage_long <- core_rel_long %>%
+    group_by(Stage, TaxonID) %>%
+    summarise(
+      NEligibleContexts = n(),
+      NPresentContexts = sum(ContextPresent, na.rm = TRUE),
+      ContextPrevalence = mean(ContextPresent, na.rm = TRUE),
+      NParksPresent = n_distinct(Park[ContextPresent]),
+      NSeasonsPresent = n_distinct(Season[ContextPresent]),
+      OverallContextAbundance = summary_value(ContextAbundance),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      AllParksAndSeasonsRepresented =
+        NParksPresent == length(EXPECTED_PARKS) &
+        NSeasonsPresent == length(SEASON_LEVELS),
+      StrictObservedCore =
+        NPresentContexts == NEligibleContexts & AllParksAndSeasonsRepresented,
+      RobustCore90 =
+        ContextPrevalence >= 0.90 & AllParksAndSeasonsRepresented
+    )
+
+  core_stage_wide <- core_stage_long %>%
+    pivot_wider(
+      id_cols = TaxonID,
+      names_from = Stage,
+      values_from = c(NEligibleContexts, NPresentContexts, ContextPrevalence,
+                      NParksPresent, NSeasonsPresent, AllParksAndSeasonsRepresented,
+                      OverallContextAbundance, StrictObservedCore, RobustCore90),
+      names_glue = "{Stage}_{.value}"
+    ) %>%
+    mutate(
+      SummaryMethod = SUMMARY_METHOD,
+      BZ_StrictObservedCore = replace_na(BZ_StrictObservedCore, FALSE),
+      EZ_StrictObservedCore = replace_na(EZ_StrictObservedCore, FALSE),
+      BZ_RobustCore90 = replace_na(BZ_RobustCore90, FALSE),
+      EZ_RobustCore90 = replace_na(EZ_RobustCore90, FALSE),
+      StrictCorePattern = case_when(
+        BZ_StrictObservedCore & EZ_StrictObservedCore ~ "Shared_BZ_EZ_core",
+        BZ_StrictObservedCore & !EZ_StrictObservedCore ~ "BZ_core_only",
+        !BZ_StrictObservedCore & EZ_StrictObservedCore ~ "EZ_core_only",
+        TRUE ~ "Not_strict_core"
+      ),
+      RobustCore90Pattern = case_when(
+        BZ_RobustCore90 & EZ_RobustCore90 ~ "Shared_BZ_EZ_core90",
+        BZ_RobustCore90 & !EZ_RobustCore90 ~ "BZ_core90_only",
+        !BZ_RobustCore90 & EZ_RobustCore90 ~ "EZ_core90_only",
+        TRUE ~ "Not_core90"
+      )
+    )
+
+  if (!is.null(tax)) core_stage_wide <- core_stage_wide %>% left_join(tax, by = "TaxonID")
+  core_stage_wide
+}
+```
+
+## 15. Run the median descriptive pipeline and write outputs
+
+```{r run-analysis}
+message("Running descriptive pipeline: median")
+
+desc <- build_descriptive_pipeline()
+hetero <- build_heterogeneity()
+integrated <- integrate_results(desc, hetero)
+stage_core <- build_stage_core()
+
+## Full trace of Cycle-context effects.
+write.csv(
+  desc$context_effects,
+  file.path(OUT_DIR, "02a_BZ_EZ_Cycle_context_effects_median.csv"),
+  row.names = FALSE
+)
+
+## Critical 4 seasons × 3 parks layer; each cell may have one or two cycles.
+write.csv(
+  desc$park_season_effects,
+  file.path(OUT_DIR, "02b_BZ_EZ_ParkSeason_effects_median.csv"),
+  row.names = FALSE
+)
+
+## Season and Park marginal summaries are diagnostic, not substitutes for
+## the strict 12-cell Park × Season consistency rule.
+write.csv(
+  desc$season_effects,
+  file.path(OUT_DIR, "02c_BZ_EZ_Season_effects_median.csv"),
+  row.names = FALSE
+)
+write.csv(
+  desc$park_effects,
+  file.path(OUT_DIR, "02d_BZ_EZ_Park_effects_median.csv"),
+  row.names = FALSE
+)
+
+## Wide recurrence diagnostics: 12 Park×Season cells + four seasons + three parks.
+recurrence_diagnostics <- desc$overall_desc %>%
+  left_join(desc$season_summary, by = c("TaxonID", "NSeasonsAvailable")) %>%
+  left_join(desc$park_summary, by = c("TaxonID", "NParksAvailable")) %>%
+  left_join(desc$park_season_matrix, by = "TaxonID") %>%
+  left_join(desc$season_matrix, by = "TaxonID") %>%
+  left_join(desc$park_matrix, by = "TaxonID")
+
+if (!is.null(tax)) recurrence_diagnostics <- recurrence_diagnostics %>% left_join(tax, by = "TaxonID")
+
+write.csv(
+  recurrence_diagnostics,
+  file.path(OUT_DIR, "04_BZ_EZ_recurrence_diagnostics_median.csv"),
+  row.names = FALSE
+)
+
+## DeltaCLR magnitude-heterogeneity diagnostics.
+heterogeneity_output <- hetero$season %>%
+  left_join(hetero$park, by = "TaxonID")
+if (!is.null(tax)) heterogeneity_output <- heterogeneity_output %>% left_join(tax, by = "TaxonID")
+
+write.csv(
+  heterogeneity_output,
+  file.path(OUT_DIR, "04b_BZ_EZ_heterogeneity_median.csv"),
+  row.names = FALSE
+)
+
+## Main one-row-per-ASV result.
+write.csv(
+  integrated,
+  file.path(OUT_DIR, "05_final_BZ_EZ_stage_selection_median.csv"),
+  row.names = FALSE
+)
+
+## Auxiliary BZ/EZ stage-core membership result.
+write.csv(
+  stage_core,
+  file.path(OUT_DIR, "06_BZ_EZ_stage_core_ASV_median.csv"),
+  row.names = FALSE
+)
+```
+
+## 16. Compact QC summary + parameter manifest
+
+```{r qc-manifest-session}
+ancombc_version <- if (RUN_ANCOMBC2) as.character(utils::packageVersion("ANCOMBC")) else "not_run"
+
+qc_summary <- data.frame(
+  Metric = c(
+    "N_BZ_EZ_samples_after_basic_QC",
+    "N_ASVs_after_basic_QC_before_prevalence_filter",
+    "N_ASVs_retained_by_StageSeason_union",
+    "N_complete_matched_Cycle_contexts_for_BZ_EZ",
+    "N_observed_ParkSeason_cells",
+    "N_ParkSeason_cells_with_two_cycles",
+    "N_ParkSeason_cells_with_one_cycle",
+    "N_missing_ParkSeason_cells"
+  ),
+  Value = c(
+    nrow(meta),
+    nrow(otu_mat),
+    length(BZ_EZ_TAXA),
+    length(eligible_groups),
+    sum(park_season_coverage$ParkSeasonObserved),
+    sum(park_season_coverage$NEligibleCycles >= 2),
+    sum(park_season_coverage$NEligibleCycles == 1),
+    sum(!park_season_coverage$ParkSeasonObserved)
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(qc_summary,
+          file.path(OUT_DIR, "00_QC_analysis_summary.csv"),
+          row.names = FALSE)
+
+parameter_manifest <- data.frame(
+  Parameter = c(
+    "DATASET_LABEL",
+    "ANALYSIS_TYPES",
+    "CORE_CYCLES",
+    "SEASON_LEVELS",
+    "EXPECTED_PARKS",
+    "EXPECTED_N_BIOREP",
+    "PREVALENCE_CUT_PRIMARY",
+    "Prevalence_filter_rule",
+    "Filtering_before_context_selection",
+    "Relative_abundance_denominator",
+    "RATIO_PSEUDOCOUNT",
+    "RATIO_PSEUDOCOUNT_role",
+    "RESPONSE_FOLD_CUTOFF",
+    "PERSISTENT_MAX_FOLD_CHANGE",
+    "SUMMARY_METHOD",
+    "Descriptive_hierarchy",
+    "Missing_cycle_handling",
+    "Strict_crosspark_fourseason_rule",
+    "ANCOMBC_version",
+    "ANCOM_model",
+    "ANCOM_p_adjust_method",
+    "ANCOM_pseudo_sens",
+    "ANCOM_core_statistical_rule",
+    "Nonrobust_rule",
+    "Heterogeneity_column_names",
+    "Heterogeneity_interpretation"
+  ),
+  Value = c(
+    DATASET_LABEL,
+    paste(ANALYSIS_TYPES, collapse = ";"),
+    paste(CORE_CYCLES, collapse = ";"),
+    paste(SEASON_LEVELS, collapse = ";"),
+    paste(EXPECTED_PARKS, collapse = ";"),
+    EXPECTED_N_BIOREP,
+    PREVALENCE_CUT_PRIMARY,
+    "Retain ASV if prevalence >=10% in at least one Stage × Season group; one common BZ–EZ union feature space",
+    "TRUE: filter ASVs first, then select complete matched BZ–EZ contexts for the BZ–EZ comparison",
+    "Raw taxon count / total raw counts of all valid BZ/EZ taxa after basic QC and before prevalence filtering",
+    RATIO_PSEUDOCOUNT,
+    "Descriptive zero handling only; never used as a statistical-robustness or Core-selection criterion",
+    RESPONSE_FOLD_CUTOFF,
+    PERSISTENT_MAX_FOLD_CHANGE,
+    SUMMARY_METHOD,
+    "biological replicates -> Cycle context -> Park×Season across available cycles -> Season/Park -> Overall; primary Overall uses the Season path and Park-path Overall is reported diagnostically",
+    "A Park×Season cell can use one or two eligible cycles; an absent cycle does not invalidate the cell if another eligible cycle exists",
+    "Strict Core recurrence requires all 12 Park×Season cells observed and all 12 same sign; it does not require every cycle to contain all 12 cells",
+    ancombc_version,
+    "Individual-sample raw counts; fix_formula = BrewingGroupID + Stage; BrewingGroupID = BrewingCycle×Season×Park",
+    ANCOM_P_ADJ_METHOD,
+    ANCOM_PSEUDO_SENS,
+    "Core statistical gate = unambiguous Structural_zero_supported OR ANCOM_DiffRobust=TRUE; plus descriptive effect-size/direction requirements",
+    "ANCOM_Diff=TRUE but ANCOM_DiffRobust!=TRUE is reported as FDR_supported_nonrobust and cannot enter any Core class",
+    "SeasonHeterogeneityP/Q and ParkHeterogeneityP/Q",
+    "Auxiliary magnitude tests on DeltaCLR; significant heterogeneity does not automatically remove a direction-consistent taxon"
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(parameter_manifest,
+          file.path(OUT_DIR, "00_analysis_parameter_manifest.csv"),
+          row.names = FALSE)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(OUT_DIR, "00_sessionInfo.txt")
+)
+
+message("============================================================")
+message("BZ–EZ median analysis complete")
+message("Output directory: ", normalizePath(OUT_DIR, winslash = "/", mustWork = FALSE))
+message("Main outputs:")
+message("  00_QC_analysis_summary.csv")
+message("  00_QC_BZ_EZ_Cycle_context_coverage.csv")
+message("  00_QC_BZ_EZ_ParkSeason_coverage.csv")
+message("  01_BZ_EZ_StageSeason_prevalence_filter.csv")
+message("  02a/02b/02c/02d ..._median.csv")
+message("  03_ANCOMBC2_global_BZ_EZ_stage_effect.csv  [single inferential result]")
+message("  04_BZ_EZ_recurrence_diagnostics_median.csv")
+message("  04b_BZ_EZ_heterogeneity_median.csv")
+message("  05_final_BZ_EZ_stage_selection_median.csv")
+message("  06_BZ_EZ_stage_core_ASV_median.csv")
+message("============================================================")
+```
