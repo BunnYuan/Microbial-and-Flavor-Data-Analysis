@@ -1,0 +1,2180 @@
+---
+title: "Flavor Compound Season–Stage Analysis"
+output:
+  github_document:
+    toc: true
+    toc_depth: 3
+---
+
+# Overview
+
+This R Markdown document contains the reproducible compound-level workflow used
+to evaluate brewing-season and fermentation-stage patterns in flavor data for BZ and EZ samples.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r initialize}
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+############################
+```
+
+## 0. Parameters
+```{r s0-parameters}
+############################
+
+## ---------- Input and output ----------
+FLAVOR_FILE <- "BZ_EZ_flavor.csv"
+META_FILE   <- "sample_metadata.csv"
+OUTDIR      <- "Flavor_compound_Season_Stage_results"
+
+## ---------- Metadata column names ----------
+META_SAMPLE_COL <- "SampleID"
+META_STAGE_COL  <- "SampleType"
+META_SEASON_COL <- "Season"
+META_PARK_COL   <- "Park"
+META_CYCLE_COL  <- "BrewingCycle"
+
+## ---------- Flavor table ----------
+## Rows = compounds; sample IDs = columns; one fixed unique compound-ID column.
+FLAVOR_COMPOUND_COL <- "CompoundID"
+
+## ---------- Formal study design ----------
+TARGET_STAGES <- c("BZ", "EZ")
+CORE_CYCLES   <- c("Cycle1", "Cycle2")
+SEASON_LEVELS <- c("Spring", "Summer", "Autumn", "Winter")
+PARK_LEVELS   <- c("70", "30", "5")
+EXPECTED_N_PER_STAGE <- 72L
+
+## ---------- Data processing ----------
+## Blank/NA values represent non-detects and are converted to zero when enabled.
+NONDETECT_AS_ZERO <- TRUE
+
+## ---------- Pseudocount selection ----------
+## "auto" is recommended: the script first evaluates the scale of observed positive values.
+## Options: "auto" or "manual".
+PSEUDOCOUNT_MODE <- "auto"
+
+## If PSEUDOCOUNT_MODE = "manual", use the value specified below.
+MANUAL_PSEUDOCOUNT <- 1
+
+LOD_VALUE <- NA_real_
+
+##   c <= 10% × Q5_positive
+##   c <=  1% × median_positive
+AUTO_PSEUDOCOUNT_MAX_RATIO_TO_Q05   <- 0.10
+AUTO_PSEUDOCOUNT_MAX_RATIO_TO_MEDIAN <- 0.01
+
+PLUS1_MAX_RATIO_TO_MEDIAN <- 0.01
+PLUS1_MAX_RATIO_TO_Q05    <- 0.10
+
+## Compare classification stability across multiple reasonable pseudocount values.
+RUN_PSEUDOCOUNT_SENSITIVITY <- TRUE
+
+PSEUDOCOUNT_SENSITIVITY_Q05_MULTIPLIERS <- c(0.05, 0.10, 0.20, 0.50)
+PSEUDOCOUNT_SENSITIVITY_MEDIAN_MULTIPLIERS <- c(0.005, 0.01)
+
+MIN_DETECTION_FRACTION_ANY_STAGE_SEASON <- 0.20
+
+## ---------- Significance thresholds ----------
+ALPHA_FDR <- 0.05
+
+## ---------- Kruskal-Wallis sensitivity / QC ----------
+## KW is used only as a one-factor sensitivity/QC analysis, not as the formal multivariable model.
+RUN_KW_SENSITIVITY <- TRUE
+KW_ADJUST_METHOD <- "BH"
+
+MIN_ABS_DELTA_LOG2_EACH_SEASON_FOR_STABLE <- 0
+
+STABLE_REQUIRE_EACH_SEASON_FDR <- FALSE
+
+## ---------- limma settings ----------
+LIMMA_TREND <- TRUE
+
+## ---------- Output controls: streamlined by default ----------
+## pseudocount sensitivity summary, README, sessionInfo.
+SAVE_DESCRIPTIVE_SUMMARY <- TRUE
+SAVE_DETAILED_QC <- FALSE
+SAVE_LOG2_MATRIX <- FALSE
+SAVE_PAIRWISE_SEASON_TESTS <- FALSE
+SAVE_KW_DETAIL_TABLES <- FALSE
+SAVE_DETAILED_PSEUDOCOUNT_SENSITIVITY <- FALSE
+
+DETAIL_DIR <- file.path(OUTDIR, "Optional_details")
+
+############################
+```
+
+## 1. Package checks
+```{r s1-package-checks}
+############################
+
+cran_pkgs <- c("dplyr", "tidyr", "readr")
+missing_cran <- cran_pkgs[
+  !vapply(cran_pkgs, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_cran) > 0) {
+  stop(
+    "Missing required CRAN package(s): ", paste(missing_cran, collapse = ", "),
+    "\nInstall them first with: install.packages(c(",
+    paste(sprintf('"%s"', missing_cran), collapse = ", "),
+    "))"
+  )
+}
+
+if (!requireNamespace("limma", quietly = TRUE)) {
+  stop(
+    "Missing required Bioconductor package: limma.\n",
+    "Install it first with:\n",
+    "if (!requireNamespace(\"BiocManager\", quietly=TRUE)) install.packages(\"BiocManager\")\n",
+    "BiocManager::install(\"limma\")"
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(limma)
+})
+
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+if (any(c(
+  SAVE_DETAILED_QC, SAVE_LOG2_MATRIX, SAVE_PAIRWISE_SEASON_TESTS,
+  SAVE_KW_DETAIL_TABLES, SAVE_DETAILED_PSEUDOCOUNT_SENSITIVITY
+))) {
+  dir.create(DETAIL_DIR, showWarnings = FALSE, recursive = TRUE)
+}
+
+############################
+```
+
+## 2. Utility functions
+
+Define contrast, joint-test, descriptive-summary, fold-change, Kruskal–Wallis, and comparison helper functions.
+
+```{r s2-utility-functions}
+############################
+
+fmt_p <- function(p) {
+  ifelse(
+    is.na(p),
+    "NA",
+    ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))
+  )
+}
+
+## ---------- Single-contrast test ----------
+run_single_contrast <- function(base_fit, contrast_vector, contrast_name) {
+
+  cm <- matrix(
+    contrast_vector,
+    ncol = 1,
+    dimnames = list(names(contrast_vector), contrast_name)
+  )
+
+  fit2 <- limma::contrasts.fit(base_fit, cm)
+  fit2 <- limma::eBayes(fit2, trend = LIMMA_TREND)
+
+  tt <- limma::topTable(
+    fit2,
+    coef = 1,
+    number = Inf,
+    adjust.method = "BH",
+    sort.by = "none",
+    confint = TRUE
+  )
+
+  ci_low_candidates  <- c("CI.L", "CI.025")
+  ci_high_candidates <- c("CI.R", "CI.975")
+
+  ci_low_col <- ci_low_candidates[
+    ci_low_candidates %in% colnames(tt)
+  ][1]
+
+  ci_high_col <- ci_high_candidates[
+    ci_high_candidates %in% colnames(tt)
+  ][1]
+
+  if (is.na(ci_low_col) || is.na(ci_high_col)) {
+    stop(
+      "No recognized confidence-interval columns were found in topTable(confint=TRUE).\n",
+      "Current column names: ", paste(colnames(tt), collapse = ", "), "\n",
+      "Expected CI columns: CI.L/CI.R or CI.025/CI.975."
+    )
+  }
+
+  data.frame(
+    CompoundID = rownames(tt),
+    Contrast = rep(contrast_name, nrow(tt)),
+    DeltaLog2 = tt$logFC,
+    CI_low = tt[[ci_low_col]],
+    CI_high = tt[[ci_high_col]],
+    t = tt$t,
+    P = tt$P.Value,
+    FDR = tt$adj.P.Val,
+    B = tt$B,
+    stringsAsFactors = FALSE
+  )
+}
+
+## ---------- Joint F test across multiple contrasts ----------
+run_joint_test <- function(base_fit, contrast_matrix, test_name) {
+
+  fit2 <- limma::contrasts.fit(base_fit, contrast_matrix)
+  fit2 <- limma::eBayes(fit2, trend = LIMMA_TREND)
+
+  tt <- limma::topTable(
+    fit2,
+    coef = seq_len(ncol(contrast_matrix)),
+    number = Inf,
+    adjust.method = "BH",
+    sort.by = "none"
+  )
+
+  if (!"F" %in% colnames(tt)) {
+    stop("The joint test did not return a moderated F statistic: ", test_name)
+  }
+
+  data.frame(
+    CompoundID = rownames(tt),
+    Test = test_name,
+    F = tt$F,
+    P = tt$P.Value,
+    FDR = tt$adj.P.Val,
+    stringsAsFactors = FALSE
+  )
+}
+
+## ---------- Construct contrast vectors ----------
+contrast_vec <- function(design_names, positive = NULL, negative = NULL,
+                         positive_weights = NULL, negative_weights = NULL) {
+
+  requested <- c(positive, negative)
+  missing_terms <- setdiff(requested, design_names)
+  if (length(missing_terms) > 0) {
+    stop(
+      "The contrast contains coefficient(s) absent from the design matrix: ",
+      paste(missing_terms, collapse = ", ")
+    )
+  }
+
+  v <- setNames(rep(0, length(design_names)), design_names)
+
+  if (!is.null(positive)) {
+    if (is.null(positive_weights)) {
+      positive_weights <- rep(1, length(positive))
+    }
+    v[positive] <- v[positive] + positive_weights
+  }
+
+  if (!is.null(negative)) {
+    if (is.null(negative_weights)) {
+      negative_weights <- rep(1, length(negative))
+    }
+    v[negative] <- v[negative] - negative_weights
+  }
+
+  v
+}
+
+## ---------- Stage × Season descriptive summaries ----------
+make_descriptive_summary <- function(raw_mat, log2_mat, meta) {
+
+  out <- vector("list", ncol(raw_mat))
+
+  for (j in seq_len(ncol(raw_mat))) {
+
+    tmp <- data.frame(
+      SampleID = rownames(raw_mat),
+      Stage = meta$Stage,
+      Season = meta$Season,
+      Raw = raw_mat[, j],
+      Log2 = log2_mat[, j],
+      stringsAsFactors = FALSE
+    )
+
+    out[[j]] <- tmp %>%
+      group_by(Stage, Season) %>%
+      summarise(
+        N = n(),
+        N_detected = sum(Raw > 0),
+        DetectionFraction = mean(Raw > 0),
+        RawMean = mean(Raw),
+        RawMedian = median(Raw),
+        Log2Mean = mean(Log2),
+        Log2Median = median(Log2),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        CompoundID = colnames(raw_mat)[j],
+        .before = 1
+      )
+  }
+
+  bind_rows(out)
+}
+
+## ---------- Seasonal extrema and range within each Stage ----------
+make_season_context <- function(desc_tbl, target_stage) {
+
+  desc_tbl %>%
+    filter(Stage == target_stage) %>%
+    group_by(CompoundID) %>%
+    summarise(
+      HighestSeason = as.character(Season[which.max(Log2Mean)]),
+      LowestSeason = as.character(Season[which.min(Log2Mean)]),
+      SeasonRange_Log2Mean = max(Log2Mean) - min(Log2Mean),
+      MaxDetectionFraction = max(DetectionFraction),
+      MinDetectionFraction = min(DetectionFraction),
+      .groups = "drop"
+    )
+}
+
+## ---------- Build classification labels ----------
+combine_flags <- function(a, b, c, d) {
+  labs <- c()
+  if (isTRUE(a)) labs <- c(labs, "A_StableFermentation")
+  if (isTRUE(b)) labs <- c(labs, "B_SeasonModulated")
+  if (isTRUE(c)) labs <- c(labs, "C_InitialSeasonMarker")
+  if (isTRUE(d)) labs <- c(labs, "D_TerminalSeasonMarker")
+  if (length(labs) == 0) "None" else paste(labs, collapse = ";")
+}
+
+## ---------- Raw-scale fold change without pseudocount ----------
+safe_raw_fc <- function(numerator, denominator) {
+  out <- rep(NA_real_, length(numerator))
+  ok <- is.finite(numerator) & is.finite(denominator)
+  out[ok & denominator > 0] <- numerator[ok & denominator > 0] / denominator[ok & denominator > 0]
+  out[ok & denominator == 0 & numerator > 0] <- Inf
+  out[ok & denominator == 0 & numerator == 0] <- NA_real_
+  out
+}
+
+## ---------- Kruskal-Wallis Season test within each Stage ----------
+run_kw_season_sensitivity <- function(raw_mat, meta, target_stage) {
+
+  idx <- as.character(meta$Stage) == target_stage
+  if (sum(idx) == 0) stop("KW: no samples were found for Stage = ", target_stage, ".")
+
+  season <- droplevels(meta$Season[idx])
+  if (nlevels(season) < 2) stop("KW: fewer than two Season levels are available for ", target_stage, ".")
+
+  xmat <- raw_mat[idx, , drop = FALSE]
+
+  out <- lapply(seq_len(ncol(xmat)), function(j) {
+    x <- xmat[, j]
+
+    if (length(unique(x[is.finite(x)])) <= 1) {
+      H <- 0
+      df <- nlevels(season) - 1
+      p <- 1
+    } else {
+      kt <- tryCatch(
+        stats::kruskal.test(x ~ season),
+        error = function(e) NULL
+      )
+
+      if (is.null(kt)) {
+        H <- NA_real_
+        df <- NA_real_
+        p <- NA_real_
+      } else {
+        H <- unname(kt$statistic)
+        df <- unname(kt$parameter)
+        p <- kt$p.value
+      }
+    }
+
+    data.frame(
+      CompoundID = colnames(xmat)[j],
+      Stage = target_stage,
+      KW_H = H,
+      KW_df = df,
+      KW_P = p,
+      N = length(x),
+      N_detected = sum(x > 0, na.rm = TRUE),
+      N_SeasonsWithDetection = length(unique(as.character(season[x > 0]))),
+      stringsAsFactors = FALSE
+    )
+  }) %>% bind_rows()
+
+  out$KW_FDR <- p.adjust(out$KW_P, method = KW_ADJUST_METHOD)
+  out$KW_P_lt_0_05 <- !is.na(out$KW_P) & out$KW_P < 0.05
+  out$KW_FDR_lt_alpha <- !is.na(out$KW_FDR) & out$KW_FDR < ALPHA_FDR
+
+  out
+}
+
+## ---------- Four-way comparison of significance calls ----------
+compare_significance_calls <- function(test1_sig, test2_sig,
+                                       test1_name = "KW",
+                                       test2_name = "AdjustedModel") {
+  ifelse(
+    test1_sig & test2_sig,
+    "Both_significant",
+    ifelse(
+      !test1_sig & test2_sig,
+      paste0(test2_name, "_only"),
+      ifelse(
+        test1_sig & !test2_sig,
+        paste0(test1_name, "_only"),
+        "Neither"
+      )
+    )
+  )
+}
+
+############################
+```
+
+## 3. Input-file checks
+```{r s3-input-file-checks}
+############################
+
+if (!file.exists(FLAVOR_FILE)) {
+  stop("Flavor data file not found: ", FLAVOR_FILE, "\nWorking directory: ", getwd())
+}
+if (!file.exists(META_FILE)) {
+  stop("Metadata file not found: ", META_FILE, "\nWorking directory: ", getwd())
+}
+
+message("Input files:")
+message("  FLAVOR_FILE = ", FLAVOR_FILE)
+message("  META_FILE   = ", META_FILE)
+message("  OUTDIR      = ", OUTDIR)
+
+############################
+```
+
+## 4. Metadata import and design QC
+```{r s4-metadata-import-and-design-qc}
+############################
+
+meta_raw <- readr::read_csv(
+  META_FILE,
+  show_col_types = FALSE,
+  name_repair = "minimal"
+)
+
+required_meta_cols <- c(
+  META_SAMPLE_COL,
+  META_STAGE_COL,
+  META_SEASON_COL,
+  META_PARK_COL,
+  META_CYCLE_COL
+)
+
+missing_meta_cols <- setdiff(required_meta_cols, colnames(meta_raw))
+if (length(missing_meta_cols) > 0) {
+  stop("Metadata is missing required column(s): ", paste(missing_meta_cols, collapse = ", "))
+}
+
+meta <- data.frame(
+  SampleID = trimws(as.character(meta_raw[[META_SAMPLE_COL]])),
+  Stage = toupper(trimws(as.character(meta_raw[[META_STAGE_COL]]))),
+  Season = trimws(as.character(meta_raw[[META_SEASON_COL]])),
+  Park = trimws(as.character(meta_raw[[META_PARK_COL]])),
+  BrewingCycle = trimws(as.character(meta_raw[[META_CYCLE_COL]])),
+  stringsAsFactors = FALSE
+)
+
+meta <- meta %>%
+  filter(
+    Stage %in% TARGET_STAGES,
+    BrewingCycle %in% CORE_CYCLES
+  )
+
+if (nrow(meta) == 0) stop("No samples remain after restricting the analysis to BZ/EZ and Cycle1/Cycle2.")
+
+if (anyNA(meta)) {
+  write.csv(
+    meta[!complete.cases(meta), , drop = FALSE],
+    file.path(OUTDIR, "ERROR_metadata_missing_core_fields.csv"),
+    row.names = FALSE
+  )
+  stop("Missing values were found in required metadata fields.")
+}
+
+if (any(meta$SampleID == "")) stop("Blank SampleID values were found in metadata.")
+
+if (anyDuplicated(meta$SampleID)) {
+  dup <- unique(meta$SampleID[duplicated(meta$SampleID)])
+  write.csv(
+    data.frame(SampleID = dup),
+    file.path(OUTDIR, "ERROR_duplicate_metadata_SampleID.csv"),
+    row.names = FALSE
+  )
+  stop("Duplicated SampleID values were found in metadata.")
+}
+
+bad_season <- setdiff(unique(meta$Season), SEASON_LEVELS)
+bad_park <- setdiff(unique(meta$Park), PARK_LEVELS)
+bad_cycle <- setdiff(unique(meta$BrewingCycle), CORE_CYCLES)
+bad_stage <- setdiff(unique(meta$Stage), TARGET_STAGES)
+
+if (length(bad_season) > 0) stop("Undefined Season value(s): ", paste(bad_season, collapse = ", "))
+if (length(bad_park) > 0) stop("Undefined Park value(s): ", paste(bad_park, collapse = ", "))
+if (length(bad_cycle) > 0) stop("Undefined BrewingCycle value(s): ", paste(bad_cycle, collapse = ", "))
+if (length(bad_stage) > 0) stop("Undefined Stage value(s): ", paste(bad_stage, collapse = ", "))
+
+stage_n <- table(meta$Stage)
+for (st in TARGET_STAGES) {
+  n_st <- if (st %in% names(stage_n)) as.integer(stage_n[[st]]) else 0L
+  if (n_st != EXPECTED_N_PER_STAGE) {
+    stop(st, " sample count = ", n_st, "; expected = ", EXPECTED_N_PER_STAGE, ".")
+  }
+}
+
+meta$Stage <- factor(meta$Stage, levels = TARGET_STAGES)
+meta$Season <- factor(meta$Season, levels = SEASON_LEVELS)
+meta$Park <- factor(meta$Park, levels = PARK_LEVELS)
+meta$BrewingCycle <- factor(meta$BrewingCycle, levels = CORE_CYCLES)
+
+## Check the Stage × Season × Park × BrewingCycle design.
+cell_count <- meta %>%
+  count(Stage, Season, Park, BrewingCycle, name = "N", .drop = FALSE)
+
+write.csv(
+  cell_count,
+  file.path(OUTDIR, "00_design_cell_counts.csv"),
+  row.names = FALSE
+)
+
+if (any(cell_count$N == 0L) || length(unique(cell_count$N)) > 1L) {
+  warning("The factorial design has empty or unequal cells; inspect 00_design_cell_counts.csv. Model estimability is checked below.")
+}
+
+message(
+  "Metadata QC passed: total samples = ", nrow(meta),
+  ";BZ=", sum(meta$Stage == "BZ"),
+  ";EZ=", sum(meta$Stage == "EZ")
+)
+
+############################
+```
+
+## 5. Import flavor matrix
+```{r s5-import-flavor-matrix}
+############################
+
+flavor_raw <- readr::read_csv(
+  FLAVOR_FILE,
+  show_col_types = FALSE,
+  name_repair = "minimal"
+)
+
+if (!FLAVOR_COMPOUND_COL %in% colnames(flavor_raw)) {
+  stop("The flavor table is missing the required ID column: ", FLAVOR_COMPOUND_COL)
+}
+
+colnames(flavor_raw) <- trimws(colnames(flavor_raw))
+if (anyDuplicated(colnames(flavor_raw))) {
+  stop("The flavor table contains duplicated column names after trimming whitespace.")
+}
+compound_id <- trimws(as.character(flavor_raw[[FLAVOR_COMPOUND_COL]]))
+
+bad_blank <- which(is.na(compound_id) | compound_id == "")
+if (length(bad_blank) > 0) {
+  write.csv(
+    data.frame(Row = bad_blank, CompoundID = compound_id[bad_blank]),
+    file.path(OUTDIR, "ERROR_blank_compound_ID.csv"),
+    row.names = FALSE
+  )
+  stop("Blank or NA CompoundID values were found.")
+}
+
+if (anyDuplicated(compound_id)) {
+  dup_values <- unique(compound_id[duplicated(compound_id)])
+  dup_rows <- which(compound_id %in% dup_values)
+  write.csv(
+    data.frame(Row = dup_rows, CompoundID = compound_id[dup_rows]),
+    file.path(OUTDIR, "ERROR_duplicate_compound_ID_rows.csv"),
+    row.names = FALSE
+  )
+  stop("Duplicated CompoundID values were found.")
+}
+
+meta_ids <- as.character(meta$SampleID)
+missing_in_flavor <- setdiff(meta_ids, colnames(flavor_raw))
+if (length(missing_in_flavor) > 0) {
+  write.csv(
+    data.frame(SampleID = missing_in_flavor),
+    file.path(OUTDIR, "ERROR_metadata_samples_missing_from_flavor.csv"),
+    row.names = FALSE
+  )
+  stop(length(missing_in_flavor), " analysis sample(s) are missing from the flavor table.")
+}
+
+flavor_numeric <- flavor_raw[, meta_ids, drop = FALSE]
+
+for (cc in meta_ids) {
+  old <- flavor_numeric[[cc]]
+  new <- suppressWarnings(as.numeric(old))
+
+  newly_na <- is.na(new) &
+    !is.na(old) &
+    trimws(as.character(old)) != ""
+
+  if (any(newly_na)) {
+    bad_rows <- which(newly_na)
+    write.csv(
+      data.frame(
+        Row = bad_rows,
+        CompoundID = compound_id[bad_rows],
+        SampleID = cc,
+        OriginalValue = as.character(old[bad_rows])
+      ),
+      file.path(
+        OUTDIR,
+        paste0("ERROR_non_numeric_", gsub("[^A-Za-z0-9_-]", "_", cc), ".csv")
+      ),
+      row.names = FALSE
+    )
+    stop("Non-numeric content was found in sample column ", cc, ".")
+  }
+
+  flavor_numeric[[cc]] <- new
+}
+
+## Transpose to sample × compound.
+raw_mat <- t(as.matrix(flavor_numeric))
+rownames(raw_mat) <- meta_ids
+colnames(raw_mat) <- compound_id
+storage.mode(raw_mat) <- "numeric"
+
+if (!identical(rownames(raw_mat), meta_ids)) {
+  stop("Sample order in the flavor matrix does not match metadata.")
+}
+
+############################
+```
+
+## 6. Non-detect handling and numeric QC
+```{r s6-non-detect-handling-and-numeric-qc}
+############################
+
+n_na_before <- sum(is.na(raw_mat))
+
+if (n_na_before > 0) {
+
+  idx_na <- which(is.na(raw_mat), arr.ind = TRUE)
+
+  if (SAVE_DETAILED_QC) {
+    write.csv(
+        data.frame(
+          SampleID = rownames(raw_mat)[idx_na[, 1]],
+          CompoundID = colnames(raw_mat)[idx_na[, 2]]
+        ),
+        file.path(DETAIL_DIR, "01_non_detect_cells_converted_to_zero.csv"),
+        row.names = FALSE
+      )
+  }
+
+  if (NONDETECT_AS_ZERO) {
+    raw_mat[is.na(raw_mat)] <- 0
+  } else {
+    stop("NA values are present while NONDETECT_AS_ZERO = FALSE.")
+  }
+}
+
+if (anyNA(raw_mat)) stop("NA values remain after non-detect handling.")
+if (any(!is.finite(raw_mat))) stop("The flavor matrix contains NaN/Inf/-Inf values.")
+
+if (any(raw_mat < 0)) {
+  idx_neg <- which(raw_mat < 0, arr.ind = TRUE)
+  write.csv(
+    data.frame(
+      SampleID = rownames(raw_mat)[idx_neg[, 1]],
+      CompoundID = colnames(raw_mat)[idx_neg[, 2]],
+      Value = raw_mat[idx_neg]
+    ),
+    file.path(OUTDIR, "ERROR_negative_flavor_values.csv"),
+    row.names = FALSE
+  )
+  stop("Negative values were found in the flavor data.")
+}
+
+############################
+```
+
+## 7. Detection-frequency filtering
+```{r s7-detection-frequency-filtering}
+############################
+
+stage_season_group <- interaction(
+  meta$Stage,
+  meta$Season,
+  drop = TRUE,
+  sep = "_"
+)
+
+all_group_levels <- levels(stage_season_group)
+
+detection_by_group <- do.call(
+  rbind,
+  lapply(all_group_levels, function(g) {
+    idx <- stage_season_group == g
+    data.frame(
+      CompoundID = colnames(raw_mat),
+      StageSeason = g,
+      N = sum(idx),
+      N_detected = colSums(raw_mat[idx, , drop = FALSE] > 0),
+      DetectionFraction = colMeans(raw_mat[idx, , drop = FALSE] > 0),
+      stringsAsFactors = FALSE
+    )
+  })
+)
+
+if (SAVE_DETAILED_QC) {
+  write.csv(
+    detection_by_group,
+    file.path(DETAIL_DIR, "02_detection_fraction_by_StageSeason.csv"),
+    row.names = FALSE
+  )
+}
+
+max_detection <- detection_by_group %>%
+  group_by(CompoundID) %>%
+  summarise(
+    MaxDetectionFractionAnyStageSeason = max(DetectionFraction),
+    .groups = "drop"
+  )
+
+## Number of true detections across all analysis samples.
+max_detection$N_detected_all <- colSums(raw_mat > 0)[
+  match(max_detection$CompoundID, colnames(raw_mat))
+]
+
+keep_tbl <- max_detection %>%
+  mutate(
+    Keep = N_detected_all > 0 &
+      MaxDetectionFractionAnyStageSeason >=
+      MIN_DETECTION_FRACTION_ANY_STAGE_SEASON
+  )
+
+write.csv(
+  keep_tbl,
+  file.path(OUTDIR, "01_compound_detection_QC.csv"),
+  row.names = FALSE
+)
+
+removed_tbl <- keep_tbl %>% filter(!Keep)
+if (SAVE_DETAILED_QC) {
+  write.csv(
+    removed_tbl,
+    file.path(DETAIL_DIR, "03_compounds_removed_by_detection_filter.csv"),
+    row.names = FALSE
+  )
+}
+
+keep_ids <- keep_tbl$CompoundID[keep_tbl$Keep]
+raw_mat <- raw_mat[, keep_ids, drop = FALSE]
+
+if (ncol(raw_mat) < 2) stop("Fewer than two compounds remain after filtering.")
+
+message(
+  "Detection-frequency filter: retained ", ncol(raw_mat),
+  " compounds; removed ", nrow(removed_tbl), " compounds."
+)
+
+############################
+```
+
+## 8. Pseudocount scale QC and automatic selection
+```{r s8-pseudocount-scale-qc-and-automatic-selecti}
+############################
+
+positive_values <- raw_mat[
+  is.finite(raw_mat) & raw_mat > 0
+]
+
+if (length(positive_values) == 0) {
+  stop("No positive values remain after filtering; the pseudocount cannot be determined.")
+}
+
+pos_q <- stats::quantile(
+  positive_values,
+  probs = c(0, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1),
+  names = FALSE,
+  type = 7
+)
+
+positive_distribution_qc <- data.frame(
+  Statistic = c(
+    "Minimum_positive", "Q01_positive", "Q05_positive",
+    "Q10_positive", "Q25_positive", "Median_positive",
+    "Q75_positive", "Maximum_positive", "Mean_positive",
+    "Zero_fraction_all_cells"
+  ),
+  Value = c(
+    pos_q[1], pos_q[2], pos_q[3], pos_q[4], pos_q[5],
+    pos_q[6], pos_q[7], pos_q[8], mean(positive_values),
+    mean(raw_mat == 0)
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  positive_distribution_qc,
+  file.path(OUTDIR, "02_pseudocount_global_QC.csv"),
+  row.names = FALSE
+)
+
+q01_positive <- as.numeric(stats::quantile(positive_values, 0.01, names = FALSE))
+q05_positive <- as.numeric(stats::quantile(positive_values, 0.05, names = FALSE))
+q10_positive <- as.numeric(stats::quantile(positive_values, 0.10, names = FALSE))
+median_positive <- median(positive_values)
+
+plus1_ratio_median <- 1 / median_positive
+plus1_ratio_q05 <- 1 / q05_positive
+
+plus1_negligible <-
+  is.finite(plus1_ratio_median) &&
+  is.finite(plus1_ratio_q05) &&
+  plus1_ratio_median <= PLUS1_MAX_RATIO_TO_MEDIAN &&
+  plus1_ratio_q05 <= PLUS1_MAX_RATIO_TO_Q05
+
+## Select the primary pseudocount:
+## 1) manual -> user-specified value
+## 2) auto + a valid common LOD -> LOD/2
+## 3) auto + +1 is sufficiently small relative to the data scale -> 1
+## 4) auto + +1 is too large -> min(10% × Q5_positive, 1% × median_positive)
+if (!PSEUDOCOUNT_MODE %in% c("auto", "manual")) {
+  stop("PSEUDOCOUNT_MODE must be either auto or manual.")
+}
+
+if (PSEUDOCOUNT_MODE == "manual") {
+
+  LOG2_PSEUDOCOUNT <- MANUAL_PSEUDOCOUNT
+  PSEUDOCOUNT_SELECTION_RULE <- "Manual user-specified pseudocount"
+
+} else if (is.finite(LOD_VALUE) && LOD_VALUE > 0) {
+
+  LOG2_PSEUDOCOUNT <- LOD_VALUE / 2
+  PSEUDOCOUNT_SELECTION_RULE <- "LOD/2 (preferred because a valid common LOD was supplied)"
+
+} else if (plus1_negligible) {
+
+  LOG2_PSEUDOCOUNT <- 1
+  PSEUDOCOUNT_SELECTION_RULE <- paste0(
+    "+1 retained because it is small relative to the observed scale: ",
+    "1/median_positive=", sprintf("%.4g", plus1_ratio_median),
+    "; 1/Q05_positive=", sprintf("%.4g", plus1_ratio_q05)
+  )
+
+} else {
+
+  c_from_q05 <- AUTO_PSEUDOCOUNT_MAX_RATIO_TO_Q05 * q05_positive
+  c_from_median <- AUTO_PSEUDOCOUNT_MAX_RATIO_TO_MEDIAN * median_positive
+
+  LOG2_PSEUDOCOUNT <- min(c_from_q05, c_from_median)
+
+  limiting_rule <- if (c_from_q05 <= c_from_median) {
+    "Q5_positive constraint"
+  } else {
+    "median_positive constraint"
+  }
+
+  PSEUDOCOUNT_SELECTION_RULE <- paste0(
+    "+1 judged too large for the observed lower abundance range; no common LOD supplied. ",
+    "Selected min(",
+    AUTO_PSEUDOCOUNT_MAX_RATIO_TO_Q05 * 100, "% × Q5_positive = ",
+    signif(c_from_q05, 6), ", ",
+    AUTO_PSEUDOCOUNT_MAX_RATIO_TO_MEDIAN * 100, "% × median_positive = ",
+    signif(c_from_median, 6), ") = ",
+    signif(LOG2_PSEUDOCOUNT, 6), ". Limiting rule: ", limiting_rule, ". ",
+    "This is a conservative data-driven pseudocount intended to remain small relative to real positive values; ",
+    "it is not interpreted as an analytical detection limit."
+  )
+}
+
+if (!is.numeric(LOG2_PSEUDOCOUNT) ||
+    length(LOG2_PSEUDOCOUNT) != 1 ||
+    !is.finite(LOG2_PSEUDOCOUNT) ||
+    LOG2_PSEUDOCOUNT <= 0) {
+  stop("The selected LOG2_PSEUDOCOUNT is not a valid positive number.")
+}
+
+## Compound-level QC of the selected global pseudocount relative to each compound scale.
+compound_pseudocount_qc <- lapply(seq_len(ncol(raw_mat)), function(j) {
+
+  z <- raw_mat[, j]
+  zp <- z[is.finite(z) & z > 0]
+
+  if (length(zp) == 0) {
+    return(data.frame(
+      CompoundID = colnames(raw_mat)[j], N_positive = 0,
+      Min_positive = NA_real_, Q05_positive = NA_real_,
+      Median_positive = NA_real_,
+      SelectedC_over_Q05 = NA_real_,
+      SelectedC_over_Median = NA_real_,
+      Plus1_over_Q05 = NA_real_, Plus1_over_Median = NA_real_
+    ))
+  }
+
+  q05j <- as.numeric(stats::quantile(zp, 0.05, names = FALSE))
+  medj <- median(zp)
+
+  data.frame(
+    CompoundID = colnames(raw_mat)[j],
+    N_positive = length(zp),
+    Min_positive = min(zp),
+    Q05_positive = q05j,
+    Median_positive = medj,
+    SelectedC_over_Q05 = LOG2_PSEUDOCOUNT / q05j,
+    SelectedC_over_Median = LOG2_PSEUDOCOUNT / medj,
+    Plus1_over_Q05 = 1 / q05j,
+    Plus1_over_Median = 1 / medj,
+    stringsAsFactors = FALSE
+  )
+}) %>% bind_rows()
+
+if (SAVE_DETAILED_QC) {
+  write.csv(
+    compound_pseudocount_qc,
+    file.path(DETAIL_DIR, "04_pseudocount_QC_by_compound.csv"),
+    row.names = FALSE
+  )
+}
+
+plus1_assessment <- if (plus1_negligible) {
+  "+1 is small relative to both the median and lower-end positive values under the preset criteria."
+} else {
+  paste0(
+    "+1 is NOT recommended as the default under the preset criteria: ",
+    "1/median_positive=", sprintf("%.4g", plus1_ratio_median),
+    " (criterion <= ", PLUS1_MAX_RATIO_TO_MEDIAN, "); ",
+    "1/Q05_positive=", sprintf("%.4g", plus1_ratio_q05),
+    " (criterion <= ", PLUS1_MAX_RATIO_TO_Q05, ")."
+  )
+}
+
+pseudocount_notes <- c(
+  "Pseudocount QC and selection",
+  "",
+  paste0("Positive minimum = ", signif(min(positive_values), 6)),
+  paste0("Positive Q01 = ", signif(q01_positive, 6)),
+  paste0("Positive Q05 = ", signif(q05_positive, 6)),
+  paste0("Positive Q10 = ", signif(q10_positive, 6)),
+  paste0("Positive median = ", signif(median_positive, 6)),
+  paste0("Zero/non-detect fraction = ", signif(mean(raw_mat == 0), 6)),
+  "",
+  plus1_assessment,
+  "",
+  paste0("Selected pseudocount = ", signif(LOG2_PSEUDOCOUNT, 8)),
+  paste0("Selection rule: ", PSEUDOCOUNT_SELECTION_RULE),
+  "",
+  "Interpretation hierarchy:",
+  "1. If a valid common analytical LOD exists in the same units, LOD/2 is preferred.",
+  "2. Without LOD, +1 is retained only when it is negligible relative to the observed positive-value scale.",
+  paste0(
+    "3. If +1 is too large and no LOD is available, the default data-driven pseudocount is min(",
+    AUTO_PSEUDOCOUNT_MAX_RATIO_TO_Q05 * 100, "% × Q5_positive, ",
+    AUTO_PSEUDOCOUNT_MAX_RATIO_TO_MEDIAN * 100, "% × median_positive)."
+  ),
+  "4. The selected value is deliberately constrained to remain small relative to both the low-end positive distribution and the overall positive-value scale.",
+  "5. This data-driven choice is a pragmatic approximation, not a physical detection limit; therefore pseudocount sensitivity analysis is retained.",
+  "6. Raw-scale fold changes should still be calculated from original values; the pseudocount is used for log-scale modelling, not to redefine biological fold change."
+)
+
+writeLines(
+  pseudocount_notes,
+  con = file.path(OUTDIR, "03_pseudocount_recommendation.txt")
+)
+
+message("Pseudocount QC:")
+message("  positive Q05 = ", signif(q05_positive, 6))
+message("  positive median = ", signif(median_positive, 6))
+message("  +1 assessment = ", plus1_assessment)
+message("  selected pseudocount = ", signif(LOG2_PSEUDOCOUNT, 8))
+message("  rule = ", PSEUDOCOUNT_SELECTION_RULE)
+
+############################
+```
+
+## 9. Log2 transformation
+```{r s9-log2-transformation}
+############################
+
+log2_mat <- log2(raw_mat + LOG2_PSEUDOCOUNT)
+
+if (anyNA(log2_mat) || any(!is.finite(log2_mat))) {
+  stop("The log2 transformation produced NA/Inf values.")
+}
+
+## No SD scaling is applied here.
+## Compound-level tests retain the effect-size scale of the log2 values.
+
+if (SAVE_LOG2_MATRIX) {
+  write.csv(
+    data.frame(SampleID = rownames(log2_mat), log2_mat, check.names = FALSE),
+    file.path(DETAIL_DIR, "05_log2_semquant_matrix_used_for_models.csv"),
+    row.names = FALSE
+  )
+}
+
+############################
+```
+
+## 10. Descriptive summaries
+```{r s10-descriptive-summaries}
+############################
+
+desc_tbl <- make_descriptive_summary(raw_mat, log2_mat, meta)
+
+if (SAVE_DESCRIPTIVE_SUMMARY) {
+  write.csv(
+    desc_tbl,
+    file.path(OUTDIR, "04_StageSeason_compound_descriptive_summary.csv"),
+    row.names = FALSE
+  )
+}
+
+bz_context <- make_season_context(desc_tbl, "BZ") %>%
+  rename(
+    BZ_HighestSeason = HighestSeason,
+    BZ_LowestSeason = LowestSeason,
+    BZ_SeasonRange_Log2Mean = SeasonRange_Log2Mean,
+    BZ_MaxDetectionFraction = MaxDetectionFraction,
+    BZ_MinDetectionFraction = MinDetectionFraction
+  )
+
+ez_context <- make_season_context(desc_tbl, "EZ") %>%
+  rename(
+    EZ_HighestSeason = HighestSeason,
+    EZ_LowestSeason = LowestSeason,
+    EZ_SeasonRange_Log2Mean = SeasonRange_Log2Mean,
+    EZ_MaxDetectionFraction = MaxDetectionFraction,
+    EZ_MinDetectionFraction = MinDetectionFraction
+  )
+
+## ----------------------------------------------------------
+
+## ----------------------------------------------------------
+raw_fc_by_season <- desc_tbl %>%
+  select(CompoundID, Stage, Season, RawMean, RawMedian) %>%
+  pivot_wider(
+    names_from = Stage,
+    values_from = c(RawMean, RawMedian),
+    names_glue = "{.value}_{Stage}"
+  ) %>%
+  mutate(
+    RawMeanFC_EZoverBZ = safe_raw_fc(RawMean_EZ, RawMean_BZ),
+    RawMedianFC_EZoverBZ = safe_raw_fc(RawMedian_EZ, RawMedian_BZ)
+  )
+
+if (SAVE_DETAILED_QC) {
+  write.csv(
+    raw_fc_by_season,
+    file.path(DETAIL_DIR, "06_raw_scale_BZ_EZ_fold_change_by_Season.csv"),
+    row.names = FALSE
+  )
+}
+
+raw_fc_season_wide <- raw_fc_by_season %>%
+  select(CompoundID, Season, RawMeanFC_EZoverBZ, RawMedianFC_EZoverBZ) %>%
+  pivot_wider(
+    names_from = Season,
+    values_from = c(RawMeanFC_EZoverBZ, RawMedianFC_EZoverBZ),
+    names_glue = "{.value}_{Season}"
+  )
+
+idx_bz <- meta$Stage == "BZ"
+idx_ez <- meta$Stage == "EZ"
+
+raw_overall_fc <- data.frame(
+  CompoundID = colnames(raw_mat),
+  RawMean_BZ_all = colMeans(raw_mat[idx_bz, , drop = FALSE]),
+  RawMean_EZ_all = colMeans(raw_mat[idx_ez, , drop = FALSE]),
+  RawMedian_BZ_all = apply(raw_mat[idx_bz, , drop = FALSE], 2, median),
+  RawMedian_EZ_all = apply(raw_mat[idx_ez, , drop = FALSE], 2, median),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    RawMeanFC_EZoverBZ_all = safe_raw_fc(RawMean_EZ_all, RawMean_BZ_all),
+    RawMedianFC_EZoverBZ_all = safe_raw_fc(RawMedian_EZ_all, RawMedian_BZ_all)
+  )
+
+if (SAVE_DETAILED_QC) {
+  write.csv(
+    raw_overall_fc,
+    file.path(DETAIL_DIR, "07_raw_scale_BZ_EZ_fold_change_overall.csv"),
+    row.names = FALSE
+  )
+}
+
+############################
+```
+
+## 10B. Kruskal–Wallis Season sensitivity analysis
+```{r s10b-kruskal-wallis-season-sensitivity-analysis}
+############################
+
+kw_bz <- NULL
+kw_ez <- NULL
+
+if (RUN_KW_SENSITIVITY) {
+
+  kw_bz <- run_kw_season_sensitivity(raw_mat, meta, "BZ") %>%
+    select(-Stage) %>%
+    rename(
+      BZ_KW_H = KW_H,
+      BZ_KW_df = KW_df,
+      BZ_KW_P = KW_P,
+      BZ_KW_FDR = KW_FDR,
+      BZ_KW_N = N,
+      BZ_KW_N_detected = N_detected,
+      BZ_KW_N_SeasonsWithDetection = N_SeasonsWithDetection,
+      BZ_KW_P_lt_0_05 = KW_P_lt_0_05,
+      BZ_KW_FDR_lt_alpha = KW_FDR_lt_alpha
+    )
+
+  kw_ez <- run_kw_season_sensitivity(raw_mat, meta, "EZ") %>%
+    select(-Stage) %>%
+    rename(
+      EZ_KW_H = KW_H,
+      EZ_KW_df = KW_df,
+      EZ_KW_P = KW_P,
+      EZ_KW_FDR = KW_FDR,
+      EZ_KW_N = N,
+      EZ_KW_N_detected = N_detected,
+      EZ_KW_N_SeasonsWithDetection = N_SeasonsWithDetection,
+      EZ_KW_P_lt_0_05 = KW_P_lt_0_05,
+      EZ_KW_FDR_lt_alpha = KW_FDR_lt_alpha
+    )
+
+  if (SAVE_KW_DETAIL_TABLES) {
+    write.csv(
+        kw_bz %>% arrange(BZ_KW_FDR, BZ_KW_P),
+        file.path(DETAIL_DIR, "08_BZ_Season_KW_raw_semquant.csv"),
+        row.names = FALSE
+      )
+  }
+
+  if (SAVE_KW_DETAIL_TABLES) {
+    write.csv(
+        kw_ez %>% arrange(EZ_KW_FDR, EZ_KW_P),
+        file.path(DETAIL_DIR, "09_EZ_Season_KW_raw_semquant.csv"),
+        row.names = FALSE
+      )
+  }
+}
+
+############################
+```
+
+## 11. Stage × Season + Park + BrewingCycle model
+```{r s11-stage-season-park-brewingcycle-model}
+############################
+
+GROUP_LEVELS <- c(
+  paste("BZ", SEASON_LEVELS, sep = "_"),
+  paste("EZ", SEASON_LEVELS, sep = "_")
+)
+
+meta$StageSeason <- factor(
+  paste(meta$Stage, meta$Season, sep = "_"),
+  levels = GROUP_LEVELS
+)
+
+if (anyNA(meta$StageSeason)) stop("StageSeason construction failed.")
+
+## Eight Stage × Season cell means + Park + BrewingCycle.
+## Park and BrewingCycle are included as background covariates.
+design <- model.matrix(
+  ~ 0 + StageSeason + Park + BrewingCycle,
+  data = meta
+)
+
+colnames(design) <- sub("^StageSeason", "", colnames(design))
+
+design_rank <- qr(design)$rank
+if (design_rank < ncol(design)) {
+  write.csv(
+    data.frame(DesignColumn = colnames(design)),
+    file.path(OUTDIR, "ERROR_design_matrix_columns.csv"),
+    row.names = FALSE
+  )
+  stop(
+    "The linear-model design matrix is rank deficient: rank = ", design_rank,
+    ",columns=", ncol(design),
+    ". Check Stage/Season/Park/BrewingCycle for complete collinearity."
+  )
+}
+
+if (SAVE_DETAILED_QC) {
+  write.csv(
+    data.frame(SampleID = meta$SampleID, design, check.names = FALSE),
+    file.path(DETAIL_DIR, "10_model_design_matrix.csv"),
+    row.names = FALSE
+  )
+}
+
+## limma input: rows = compounds, columns = samples.
+Y <- t(log2_mat)
+
+if (!identical(colnames(Y), as.character(meta$SampleID))) {
+  stop("Sample order in the limma input matrix does not match metadata.")
+}
+
+base_fit <- limma::lmFit(Y, design)
+
+design_names <- colnames(design)
+
+############################
+```
+
+## 12. Season-associated compounds within BZ and EZ
+```{r s12-season-associated-compounds-within-bz-and}
+############################
+
+## Joint F test for overall differences among the four seasons.
+## Three independent contrasts use Spring as the reference; the joint test is reference-invariant.
+
+make_season_joint_matrix <- function(stage_name) {
+
+  ref <- paste(stage_name, "Spring", sep = "_")
+  others <- c("Summer", "Autumn", "Winter")
+
+  cm <- sapply(others, function(ss) {
+    contrast_vec(
+      design_names,
+      positive = paste(stage_name, ss, sep = "_"),
+      negative = ref
+    )
+  })
+
+  if (is.null(dim(cm))) cm <- matrix(cm, ncol = 1)
+  rownames(cm) <- design_names
+  colnames(cm) <- paste0(stage_name, "_", others, "_vs_Spring")
+  cm
+}
+
+bz_season_joint <- run_joint_test(
+  base_fit,
+  make_season_joint_matrix("BZ"),
+  "BZ_Season_omnibus"
+) %>%
+  rename(
+    BZ_Season_F = F,
+    BZ_Season_P = P,
+    BZ_Season_FDR = FDR
+  ) %>%
+  select(-Test) %>%
+  left_join(bz_context, by = "CompoundID")
+
+ez_season_joint <- run_joint_test(
+  base_fit,
+  make_season_joint_matrix("EZ"),
+  "EZ_Season_omnibus"
+) %>%
+  rename(
+    EZ_Season_F = F,
+    EZ_Season_P = P,
+    EZ_Season_FDR = FDR
+  ) %>%
+  select(-Test) %>%
+  left_join(ez_context, by = "CompoundID")
+
+
+## ---------- Optional pairwise comparisons among seasons ----------
+if (SAVE_PAIRWISE_SEASON_TESTS) {
+
+  season_pairs <- combn(SEASON_LEVELS, 2, simplify = FALSE)
+
+  run_stage_season_pairwise <- function(stage_name) {
+
+    out <- lapply(season_pairs, function(pr) {
+      s1 <- pr[1]
+      s2 <- pr[2]
+
+      cv <- contrast_vec(
+        design_names,
+        positive = paste(stage_name, s2, sep = "_"),
+        negative = paste(stage_name, s1, sep = "_")
+      )
+
+      run_single_contrast(
+        base_fit,
+        cv,
+        paste0(stage_name, "_", s2, "_vs_", s1)
+      ) %>%
+        mutate(
+          Stage = stage_name,
+          Season1 = s1,
+          Season2 = s2,
+          Direction = case_when(
+            DeltaLog2 > 0 ~ paste0(s2, " > ", s1),
+            DeltaLog2 < 0 ~ paste0(s2, " < ", s1),
+            TRUE ~ "No_direction"
+          ),
+          .before = 2
+        )
+    })
+
+    bind_rows(out)
+  }
+
+  bz_season_pairwise <- run_stage_season_pairwise("BZ")
+  ez_season_pairwise <- run_stage_season_pairwise("EZ")
+
+  write.csv(
+    bz_season_pairwise %>% arrange(Contrast, FDR, desc(abs(DeltaLog2))),
+    file.path(DETAIL_DIR, "11_BZ_Season_pairwise_compound_tests.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    ez_season_pairwise %>% arrange(Contrast, FDR, desc(abs(DeltaLog2))),
+    file.path(DETAIL_DIR, "12_EZ_Season_pairwise_compound_tests.csv"),
+    row.names = FALSE
+  )
+}
+
+############################
+```
+
+## 13. Overall BZ-to-EZ fermentation response
+```{r s13-overall-bz-to-ez-fermentation-response}
+############################
+
+bz_cells <- paste("BZ", SEASON_LEVELS, sep = "_")
+ez_cells <- paste("EZ", SEASON_LEVELS, sep = "_")
+
+cv_overall_stage <- contrast_vec(
+  design_names,
+  positive = ez_cells,
+  negative = bz_cells,
+  positive_weights = rep(1 / 4, 4),
+  negative_weights = rep(1 / 4, 4)
+)
+
+overall_stage <- run_single_contrast(
+  base_fit,
+  cv_overall_stage,
+  "Overall_EZ_minus_BZ_average_across_4_seasons"
+) %>%
+  rename(
+    Overall_DeltaLog2_EZminusBZ = DeltaLog2,
+    Overall_CI_low = CI_low,
+    Overall_CI_high = CI_high,
+    Overall_t = t,
+    Overall_P = P,
+    Overall_FDR = FDR,
+    Overall_B = B
+  ) %>%
+  select(-Contrast) %>%
+  mutate(
+    OverallResponse = case_when(
+      Overall_FDR < ALPHA_FDR & Overall_DeltaLog2_EZminusBZ > 0 ~ "EZ_enriched",
+      Overall_FDR < ALPHA_FDR & Overall_DeltaLog2_EZminusBZ < 0 ~ "EZ_depleted",
+      TRUE ~ "Not_significant"
+    )
+  )
+
+
+############################
+```
+
+## 14. Season-specific BZ-to-EZ responses
+```{r s14-season-specific-bz-to-ez-responses}
+############################
+
+stage_season_response_long <- bind_rows(
+  lapply(SEASON_LEVELS, function(ss) {
+
+    cv <- contrast_vec(
+      design_names,
+      positive = paste("EZ", ss, sep = "_"),
+      negative = paste("BZ", ss, sep = "_")
+    )
+
+    run_single_contrast(
+      base_fit,
+      cv,
+      paste0(ss, "_EZ_minus_BZ")
+    ) %>%
+      mutate(
+        Season = ss,
+        Direction = case_when(
+          DeltaLog2 > 0 ~ "EZ_enriched",
+          DeltaLog2 < 0 ~ "EZ_depleted",
+          TRUE ~ "No_direction"
+        ),
+        .before = 2
+      )
+  })
+)
+
+
+## Convert to wide format for classification.
+stage_season_response_wide <- stage_season_response_long %>%
+  select(CompoundID, Season, DeltaLog2, P, FDR) %>%
+  pivot_wider(
+    names_from = Season,
+    values_from = c(DeltaLog2, P, FDR),
+    names_glue = "{.value}_{Season}"
+  )
+
+############################
+```
+
+## 15. Stage × Season interaction
+```{r s15-stage-season-interaction}
+############################
+
+## Test whether the EZ-BZ response differs by Season.
+## Use the Spring stage effect as reference and jointly test the other three seasons.
+
+cv_int_summer <- contrast_vec(
+  design_names,
+  positive = c("EZ_Summer", "BZ_Spring"),
+  negative = c("BZ_Summer", "EZ_Spring")
+)
+
+cv_int_autumn <- contrast_vec(
+  design_names,
+  positive = c("EZ_Autumn", "BZ_Spring"),
+  negative = c("BZ_Autumn", "EZ_Spring")
+)
+
+cv_int_winter <- contrast_vec(
+  design_names,
+  positive = c("EZ_Winter", "BZ_Spring"),
+  negative = c("BZ_Winter", "EZ_Spring")
+)
+
+interaction_cm <- cbind(
+  Summer_vs_Spring_stage_effect = cv_int_summer,
+  Autumn_vs_Spring_stage_effect = cv_int_autumn,
+  Winter_vs_Spring_stage_effect = cv_int_winter
+)
+
+stage_season_interaction <- run_joint_test(
+  base_fit,
+  interaction_cm,
+  "Stage_x_Season_omnibus"
+) %>%
+  rename(
+    StageSeasonInteraction_F = F,
+    StageSeasonInteraction_P = P,
+    StageSeasonInteraction_FDR = FDR
+  ) %>%
+  select(-Test)
+
+
+############################
+```
+
+## 16. Master table and final classification axes
+```{r s16-master-table-and-final-classification-axes}
+############################
+
+master <- overall_stage %>%
+  full_join(stage_season_response_wide, by = "CompoundID") %>%
+  full_join(stage_season_interaction, by = "CompoundID") %>%
+  full_join(bz_season_joint, by = "CompoundID") %>%
+  full_join(ez_season_joint, by = "CompoundID") %>%
+  left_join(raw_overall_fc, by = "CompoundID") %>%
+  left_join(raw_fc_season_wide, by = "CompoundID")
+
+if (RUN_KW_SENSITIVITY) {
+  master <- master %>%
+    left_join(kw_bz, by = "CompoundID") %>%
+    left_join(kw_ez, by = "CompoundID")
+}
+
+## Check required columns.
+needed_delta_cols <- paste0("DeltaLog2_", SEASON_LEVELS)
+needed_fdr_cols <- paste0("FDR_", SEASON_LEVELS)
+
+if (!all(needed_delta_cols %in% colnames(master))) {
+  stop("The classification table is missing season-specific Stage-effect column(s): ", paste(setdiff(needed_delta_cols, colnames(master)), collapse = ", "))
+}
+
+season_delta_mat <- as.matrix(master[, needed_delta_cols, drop = FALSE])
+season_fdr_mat <- as.matrix(master[, needed_fdr_cols, drop = FALSE])
+
+all_positive <- apply(
+  season_delta_mat,
+  1,
+  function(z) all(is.finite(z)) && all(z > 0)
+)
+
+all_negative <- apply(
+  season_delta_mat,
+  1,
+  function(z) all(is.finite(z)) && all(z < 0)
+)
+
+same_direction <- all_positive | all_negative
+
+min_abs_delta <- apply(
+  abs(season_delta_mat),
+  1,
+  function(z) if (all(is.finite(z))) min(z) else NA_real_
+)
+
+all_season_fdr_sig <- apply(
+  season_fdr_mat,
+  1,
+  function(z) all(is.finite(z)) && all(z < ALPHA_FDR)
+)
+
+stable_base <-
+  !is.na(master$Overall_FDR) &
+  master$Overall_FDR < ALPHA_FDR &
+  same_direction &
+  !is.na(min_abs_delta) &
+  min_abs_delta >= MIN_ABS_DELTA_LOG2_EACH_SEASON_FOR_STABLE
+
+if (STABLE_REQUIRE_EACH_SEASON_FDR) {
+  stable_base <- stable_base & all_season_fdr_sig
+}
+
+master$A_StableFermentation <- stable_base
+master$A_StableDirection <- ifelse(
+  all_positive,
+  "EZ_enriched_all_4_seasons",
+  ifelse(all_negative, "EZ_depleted_all_4_seasons", "Not_same_direction")
+)
+master$A_MinAbsDeltaLog2AcrossSeasons <- min_abs_delta
+master$A_All4SeasonContrastsFDRsig <- all_season_fdr_sig
+
+master$B_SeasonModulatedFermentation <-
+  !is.na(master$StageSeasonInteraction_FDR) &
+  master$StageSeasonInteraction_FDR < ALPHA_FDR
+
+master$C_InitialSeasonMarker <-
+  !is.na(master$BZ_Season_FDR) &
+  master$BZ_Season_FDR < ALPHA_FDR
+
+master$D_TerminalSeasonMarker <-
+  !is.na(master$EZ_Season_FDR) &
+  master$EZ_Season_FDR < ALPHA_FDR
+
+## ----------------------------------------------------------
+## Final fermentation-response classification (I-IV, mutually exclusive)
+## ----------------------------------------------------------
+master$FermentationResponseType <- case_when(
+  master$A_StableFermentation & master$B_SeasonModulatedFermentation ~
+    "I_Stable_direction_but_season_modulated",
+  master$A_StableFermentation & !master$B_SeasonModulatedFermentation ~
+    "II_Stable_season_independent",
+  !master$A_StableFermentation & master$B_SeasonModulatedFermentation ~
+    "III_Season_dependent_directionally_nonstable",
+  TRUE ~ "IV_Other"
+)
+
+## Legacy output labels are retained for downstream compatibility.
+## Type II means no detected Stage x Season interaction, not proven independence.
+## Type III means B is supported but the full A criterion is not met; it does
+## not necessarily mean that the four estimated stage effects change sign.
+
+## Compare KW calls with the formal multivariable Season omnibus model.
+## A-D flags are defined by the formal model; the following fields are sensitivity/QC only.
+if (RUN_KW_SENSITIVITY) {
+
+  master$BZ_Model_P_lt_0_05 <-
+    !is.na(master$BZ_Season_P) & master$BZ_Season_P < 0.05
+  master$EZ_Model_P_lt_0_05 <-
+    !is.na(master$EZ_Season_P) & master$EZ_Season_P < 0.05
+
+  master$BZ_Model_FDR_lt_alpha <- master$C_InitialSeasonMarker
+  master$EZ_Model_FDR_lt_alpha <- master$D_TerminalSeasonMarker
+
+  master$BZ_KW_vs_Model_rawP <- compare_significance_calls(
+    master$BZ_KW_P_lt_0_05,
+    master$BZ_Model_P_lt_0_05,
+    "KW",
+    "AdjustedModel"
+  )
+
+  master$EZ_KW_vs_Model_rawP <- compare_significance_calls(
+    master$EZ_KW_P_lt_0_05,
+    master$EZ_Model_P_lt_0_05,
+    "KW",
+    "AdjustedModel"
+  )
+
+  master$BZ_KW_vs_Model_FDR <- compare_significance_calls(
+    master$BZ_KW_FDR_lt_alpha,
+    master$BZ_Model_FDR_lt_alpha,
+    "KW",
+    "AdjustedModel"
+  )
+
+  master$EZ_KW_vs_Model_FDR <- compare_significance_calls(
+    master$EZ_KW_FDR_lt_alpha,
+    master$EZ_Model_FDR_lt_alpha,
+    "KW",
+    "AdjustedModel"
+  )
+
+  master$BZ_KW_rawP_sig_but_Model_FDR_not <-
+    master$BZ_KW_P_lt_0_05 & !master$BZ_Model_FDR_lt_alpha
+  master$EZ_KW_rawP_sig_but_Model_FDR_not <-
+    master$EZ_KW_P_lt_0_05 & !master$EZ_Model_FDR_lt_alpha
+
+  master$BZ_Model_FDR_sig_but_KW_rawP_not <-
+    master$BZ_Model_FDR_lt_alpha & !master$BZ_KW_P_lt_0_05
+  master$EZ_Model_FDR_sig_but_KW_rawP_not <-
+    master$EZ_Model_FDR_lt_alpha & !master$EZ_KW_P_lt_0_05
+}
+
+## Sort MASTER by I-IV response type and then by the primary FDR values.
+master <- master %>%
+  arrange(
+    FermentationResponseType,
+    StageSeasonInteraction_FDR,
+    Overall_FDR,
+    BZ_Season_FDR,
+    EZ_Season_FDR
+  )
+
+write.csv(
+  master,
+  file.path(OUTDIR, "05_MASTER_compound_results.csv"),
+  row.names = FALSE
+)
+
+############################
+```
+
+## 17. Core classification outputs
+
+Write the principal fermentation-response classification table.
+
+```{r s17-core-classification-outputs}
+############################
+```
+
+## 17A. I-IV fermentation-response types; each compound belongs to one type only.
+
+```{r s17a-axis-1-i-iv}
+fermentation_response_table <- master %>%
+  mutate(
+    FermentationResponseTypeOrder = case_when(
+      FermentationResponseType == "I_Stable_direction_but_season_modulated" ~ 1L,
+      FermentationResponseType == "II_Stable_season_independent" ~ 2L,
+      FermentationResponseType == "III_Season_dependent_directionally_nonstable" ~ 3L,
+      TRUE ~ 4L
+    )
+  ) %>%
+  arrange(FermentationResponseTypeOrder, StageSeasonInteraction_FDR, Overall_FDR) %>%
+  select(-FermentationResponseTypeOrder)
+
+write.csv(
+  fermentation_response_table,
+  file.path(OUTDIR, "06_Fermentation_response_types_I_to_IV.csv"),
+  row.names = FALSE
+)
+```
+
+## 18. Classification summary
+
+Summarize the number of compounds assigned to each major category.
+
+```{r s18-classification-summary}
+############################
+
+classification_summary <- data.frame(
+  Axis = c(
+    rep("FermentationResponse", 5),
+    rep("SeasonMarker", 2)
+  ),
+  Category = c(
+    "All_tested_compounds",
+    "I_Stable_direction_but_season_modulated",
+    "II_Stable_season_independent",
+    "III_Season_dependent_directionally_nonstable",
+    "IV_Other",
+    "C_InitialSeasonMarker_BZ_total",
+    "D_TerminalSeasonMarker_EZ_total"
+  ),
+  N = c(
+    nrow(master),
+    sum(master$FermentationResponseType == "I_Stable_direction_but_season_modulated"),
+    sum(master$FermentationResponseType == "II_Stable_season_independent"),
+    sum(master$FermentationResponseType == "III_Season_dependent_directionally_nonstable"),
+    sum(master$FermentationResponseType == "IV_Other"),
+    sum(master$C_InitialSeasonMarker),
+    sum(master$D_TerminalSeasonMarker)
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  classification_summary,
+  file.path(OUTDIR, "09_classification_summary.csv"),
+  row.names = FALSE
+)
+
+############################
+```
+
+## 18B. KW versus adjusted-model concordance
+```{r s18b-kw-versus-adjusted-model-concordance}
+############################
+
+kw_model_summary <- NULL
+kw_model_discordant <- NULL
+
+if (RUN_KW_SENSITIVITY) {
+
+  make_concordance_summary <- function(stage_name, criterion, comparison_vector) {
+    lv <- c("Both_significant", "AdjustedModel_only", "KW_only", "Neither")
+    tt <- table(factor(comparison_vector, levels = lv))
+    data.frame(
+      Stage = stage_name,
+      Criterion = criterion,
+      Call = lv,
+      N = as.integer(tt),
+      Fraction = as.integer(tt) / length(comparison_vector),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  kw_model_summary <- bind_rows(
+    make_concordance_summary("BZ", "raw_P_lt_0.05", master$BZ_KW_vs_Model_rawP),
+    make_concordance_summary("EZ", "raw_P_lt_0.05", master$EZ_KW_vs_Model_rawP),
+    make_concordance_summary("BZ", paste0("BH_FDR_lt_", ALPHA_FDR), master$BZ_KW_vs_Model_FDR),
+    make_concordance_summary("EZ", paste0("BH_FDR_lt_", ALPHA_FDR), master$EZ_KW_vs_Model_FDR)
+  )
+
+  write.csv(
+    kw_model_summary,
+    file.path(OUTDIR, "10_KW_vs_adjusted_model_summary.csv"),
+    row.names = FALSE
+  )
+
+  make_discordant_stage <- function(stage_name) {
+
+    if (stage_name == "BZ") {
+      tmp <- master %>%
+        transmute(
+          Stage = "BZ", CompoundID,
+          FDR_Comparison = BZ_KW_vs_Model_FDR,
+          KW_P = BZ_KW_P, KW_FDR = BZ_KW_FDR,
+          AdjustedModel_P = BZ_Season_P, AdjustedModel_FDR = BZ_Season_FDR,
+          KW_rawP_sig_but_Model_FDR_not = BZ_KW_rawP_sig_but_Model_FDR_not,
+          Model_FDR_sig_but_KW_rawP_not = BZ_Model_FDR_sig_but_KW_rawP_not,
+          FermentationResponseType
+        )
+    } else {
+      tmp <- master %>%
+        transmute(
+          Stage = "EZ", CompoundID,
+          FDR_Comparison = EZ_KW_vs_Model_FDR,
+          KW_P = EZ_KW_P, KW_FDR = EZ_KW_FDR,
+          AdjustedModel_P = EZ_Season_P, AdjustedModel_FDR = EZ_Season_FDR,
+          KW_rawP_sig_but_Model_FDR_not = EZ_KW_rawP_sig_but_Model_FDR_not,
+          Model_FDR_sig_but_KW_rawP_not = EZ_Model_FDR_sig_but_KW_rawP_not,
+          FermentationResponseType
+        )
+    }
+
+    tmp %>%
+      mutate(
+        PrismStyleComparison = case_when(
+          KW_rawP_sig_but_Model_FDR_not ~ "KW_rawP_significant_but_Model_FDR_not",
+          Model_FDR_sig_but_KW_rawP_not ~ "Model_FDR_significant_but_KW_rawP_not",
+          TRUE ~ "No_PrismStyle_discordance"
+        )
+      ) %>%
+      filter(
+        FDR_Comparison %in% c("KW_only", "AdjustedModel_only") |
+          PrismStyleComparison != "No_PrismStyle_discordance"
+      )
+  }
+
+  kw_model_discordant <- bind_rows(
+    make_discordant_stage("BZ"),
+    make_discordant_stage("EZ")
+  ) %>%
+    arrange(Stage, FDR_Comparison, AdjustedModel_FDR, KW_FDR)
+
+  write.csv(
+    kw_model_discordant,
+    file.path(OUTDIR, "11_KW_adjusted_model_discordant_compounds.csv"),
+    row.names = FALSE
+  )
+}
+
+############################
+```
+
+## 19. Pseudocount sensitivity analysis
+```{r s19-pseudocount-sensitivity-analysis}
+############################
+
+if (RUN_PSEUDOCOUNT_SENSITIVITY) {
+
+  candidate_tbl <- data.frame(
+    Rule = character(0),
+    Pseudocount = numeric(0),
+    stringsAsFactors = FALSE
+  )
+
+  candidate_tbl <- bind_rows(
+    candidate_tbl,
+    data.frame(Rule = "Fixed_plus_1", Pseudocount = 1)
+  )
+
+  for (mm in PSEUDOCOUNT_SENSITIVITY_Q05_MULTIPLIERS) {
+    candidate_tbl <- bind_rows(
+      candidate_tbl,
+      data.frame(
+        Rule = paste0(mm * 100, "pct_of_Q05_positive"),
+        Pseudocount = mm * q05_positive
+      )
+    )
+  }
+
+  for (mm in PSEUDOCOUNT_SENSITIVITY_MEDIAN_MULTIPLIERS) {
+    candidate_tbl <- bind_rows(
+      candidate_tbl,
+      data.frame(
+        Rule = paste0(mm * 100, "pct_of_median_positive"),
+        Pseudocount = mm * median_positive
+      )
+    )
+  }
+
+  candidate_tbl <- bind_rows(
+    candidate_tbl,
+    data.frame(Rule = "Primary_selected", Pseudocount = LOG2_PSEUDOCOUNT)
+  )
+
+  if (is.finite(LOD_VALUE) && LOD_VALUE > 0) {
+    candidate_tbl <- bind_rows(
+      candidate_tbl,
+      data.frame(Rule = "LOD_over_2", Pseudocount = LOD_VALUE / 2)
+    )
+  }
+
+  candidate_tbl <- candidate_tbl %>%
+    filter(is.finite(Pseudocount), Pseudocount > 0) %>%
+    arrange(Pseudocount)
+
+  candidate_tbl$Key <- signif(candidate_tbl$Pseudocount, 12)
+  candidate_tbl <- candidate_tbl %>%
+    arrange(desc(Rule == "Primary_selected")) %>%
+    distinct(Key, .keep_all = TRUE) %>%
+    select(-Key) %>%
+    arrange(Pseudocount)
+
+  if (SAVE_DETAILED_PSEUDOCOUNT_SENSITIVITY) {
+    write.csv(
+        candidate_tbl,
+        file.path(DETAIL_DIR, "13_pseudocount_sensitivity_candidates.csv"),
+        row.names = FALSE
+      )
+  }
+
+  run_core_classification_for_c <- function(c_value, c_rule) {
+
+    logm <- log2(raw_mat + c_value)
+    Yc <- t(logm)
+    fitc <- limma::lmFit(Yc, design)
+
+    bzj <- run_joint_test(
+      fitc, make_season_joint_matrix("BZ"), "BZ_Season_omnibus"
+    ) %>%
+      transmute(CompoundID, BZ_Season_FDR = FDR)
+
+    ezj <- run_joint_test(
+      fitc, make_season_joint_matrix("EZ"), "EZ_Season_omnibus"
+    ) %>%
+      transmute(CompoundID, EZ_Season_FDR = FDR)
+
+    ov <- run_single_contrast(
+      fitc, cv_overall_stage, "Overall_EZ_minus_BZ_average_across_4_seasons"
+    ) %>%
+      transmute(
+        CompoundID,
+        Overall_DeltaLog2_EZminusBZ = DeltaLog2,
+        Overall_FDR = FDR
+      )
+
+    ints <- run_joint_test(
+      fitc, interaction_cm, "Stage_x_Season_omnibus"
+    ) %>%
+      transmute(CompoundID, StageSeasonInteraction_FDR = FDR)
+
+    seas <- bind_rows(lapply(SEASON_LEVELS, function(ss) {
+      cv <- contrast_vec(
+        design_names,
+        positive = paste("EZ", ss, sep = "_"),
+        negative = paste("BZ", ss, sep = "_")
+      )
+      run_single_contrast(fitc, cv, paste0(ss, "_EZ_minus_BZ")) %>%
+        transmute(CompoundID, Season = ss, DeltaLog2, FDR)
+    }))
+
+    seas_w <- seas %>%
+      pivot_wider(
+        names_from = Season,
+        values_from = c(DeltaLog2, FDR),
+        names_glue = "{.value}_{Season}"
+      )
+
+    tmp <- ov %>%
+      full_join(seas_w, by = "CompoundID") %>%
+      full_join(ints, by = "CompoundID") %>%
+      full_join(bzj, by = "CompoundID") %>%
+      full_join(ezj, by = "CompoundID")
+
+    delta_cols <- paste0("DeltaLog2_", SEASON_LEVELS)
+    fdr_cols <- paste0("FDR_", SEASON_LEVELS)
+    dm <- as.matrix(tmp[, delta_cols, drop = FALSE])
+    fm <- as.matrix(tmp[, fdr_cols, drop = FALSE])
+
+    pos <- apply(dm, 1, function(z) all(is.finite(z)) && all(z > 0))
+    neg <- apply(dm, 1, function(z) all(is.finite(z)) && all(z < 0))
+    same <- pos | neg
+    minabs <- apply(abs(dm), 1, function(z) if (all(is.finite(z))) min(z) else NA_real_)
+    allsig <- apply(fm, 1, function(z) all(is.finite(z)) && all(z < ALPHA_FDR))
+
+    A <- !is.na(tmp$Overall_FDR) &
+      tmp$Overall_FDR < ALPHA_FDR &
+      same & !is.na(minabs) &
+      minabs >= MIN_ABS_DELTA_LOG2_EACH_SEASON_FOR_STABLE
+
+    if (STABLE_REQUIRE_EACH_SEASON_FDR) A <- A & allsig
+
+    tmp %>%
+      transmute(
+        CompoundID,
+        PseudocountRule = c_rule,
+        Pseudocount = c_value,
+        Overall_FDR,
+        StageSeasonInteraction_FDR,
+        BZ_Season_FDR,
+        EZ_Season_FDR,
+        A_StableFermentation = A,
+        B_SeasonModulatedFermentation =
+          !is.na(StageSeasonInteraction_FDR) & StageSeasonInteraction_FDR < ALPHA_FDR,
+        C_InitialSeasonMarker =
+          !is.na(BZ_Season_FDR) & BZ_Season_FDR < ALPHA_FDR,
+        D_TerminalSeasonMarker =
+          !is.na(EZ_Season_FDR) & EZ_Season_FDR < ALPHA_FDR
+      )
+  }
+
+  sens_long <- bind_rows(lapply(seq_len(nrow(candidate_tbl)), function(i) {
+    run_core_classification_for_c(
+      candidate_tbl$Pseudocount[i],
+      candidate_tbl$Rule[i]
+    )
+  }))
+
+  if (SAVE_DETAILED_PSEUDOCOUNT_SENSITIVITY) {
+    write.csv(
+        sens_long,
+        file.path(DETAIL_DIR, "14_pseudocount_sensitivity_core_classification_long.csv"),
+        row.names = FALSE
+      )
+  }
+
+  primary_rule <- candidate_tbl$Rule[
+    which.min(abs(candidate_tbl$Pseudocount - LOG2_PSEUDOCOUNT))
+  ]
+
+  ref <- sens_long %>%
+    filter(PseudocountRule == primary_rule) %>%
+    select(
+      CompoundID,
+      Ref_A = A_StableFermentation,
+      Ref_B = B_SeasonModulatedFermentation,
+      Ref_C = C_InitialSeasonMarker,
+      Ref_D = D_TerminalSeasonMarker
+    )
+
+  safe_jaccard <- function(x, y) {
+    u <- sum(x | y, na.rm = TRUE)
+    if (u == 0) return(1)
+    sum(x & y, na.rm = TRUE) / u
+  }
+
+  sensitivity_summary <- sens_long %>%
+    left_join(ref, by = "CompoundID") %>%
+    group_by(PseudocountRule, Pseudocount) %>%
+    summarise(
+      N_A = sum(A_StableFermentation, na.rm = TRUE),
+      N_B = sum(B_SeasonModulatedFermentation, na.rm = TRUE),
+      N_C = sum(C_InitialSeasonMarker, na.rm = TRUE),
+      N_D = sum(D_TerminalSeasonMarker, na.rm = TRUE),
+      Agreement_A = mean(A_StableFermentation == Ref_A, na.rm = TRUE),
+      Agreement_B = mean(B_SeasonModulatedFermentation == Ref_B, na.rm = TRUE),
+      Agreement_C = mean(C_InitialSeasonMarker == Ref_C, na.rm = TRUE),
+      Agreement_D = mean(D_TerminalSeasonMarker == Ref_D, na.rm = TRUE),
+      Agreement_all4 = mean(
+        A_StableFermentation == Ref_A &
+        B_SeasonModulatedFermentation == Ref_B &
+        C_InitialSeasonMarker == Ref_C &
+        D_TerminalSeasonMarker == Ref_D,
+        na.rm = TRUE
+      ),
+      Jaccard_A = safe_jaccard(A_StableFermentation, Ref_A),
+      Jaccard_B = safe_jaccard(B_SeasonModulatedFermentation, Ref_B),
+      Jaccard_C = safe_jaccard(C_InitialSeasonMarker, Ref_C),
+      Jaccard_D = safe_jaccard(D_TerminalSeasonMarker, Ref_D),
+      .groups = "drop"
+    )
+
+  write.csv(
+    sensitivity_summary,
+    file.path(OUTDIR, "12_pseudocount_sensitivity_summary.csv"),
+    row.names = FALSE
+  )
+
+  compound_stability <- sens_long %>%
+    group_by(CompoundID) %>%
+    summarise(
+      N_candidates = n(),
+      A_calls = sum(A_StableFermentation, na.rm = TRUE),
+      B_calls = sum(B_SeasonModulatedFermentation, na.rm = TRUE),
+      C_calls = sum(C_InitialSeasonMarker, na.rm = TRUE),
+      D_calls = sum(D_TerminalSeasonMarker, na.rm = TRUE),
+      A_stable_across_candidates = n_distinct(A_StableFermentation) == 1,
+      B_stable_across_candidates = n_distinct(B_SeasonModulatedFermentation) == 1,
+      C_stable_across_candidates = n_distinct(C_InitialSeasonMarker) == 1,
+      D_stable_across_candidates = n_distinct(D_TerminalSeasonMarker) == 1,
+      All4_stable_across_candidates =
+        A_stable_across_candidates &
+        B_stable_across_candidates &
+        C_stable_across_candidates &
+        D_stable_across_candidates,
+      .groups = "drop"
+    )
+
+  if (SAVE_DETAILED_PSEUDOCOUNT_SENSITIVITY) {
+    write.csv(
+        compound_stability,
+        file.path(DETAIL_DIR, "15_pseudocount_sensitivity_compound_stability.csv"),
+        row.names = FALSE
+      )
+  }
+}
+
+############################
+```
+
+## 20. Method and threshold record
+```{r s20-method-and-threshold-record}
+############################
+
+method_notes <- c(
+  "FINAL Flavor compound-level Season/Stage analysis",
+  "",
+  paste0("Input: flavor compound values; nondetects as zero = ", NONDETECT_AS_ZERO),
+  paste0("Transformation: log2(x + ", LOG2_PSEUDOCOUNT, ")"),
+  paste0("Pseudocount mode: ", PSEUDOCOUNT_MODE),
+  paste0("Pseudocount selection rule: ", PSEUDOCOUNT_SELECTION_RULE),
+  paste0("Positive Q05 = ", signif(q05_positive, 6), "; positive median = ", signif(median_positive, 6)),
+  paste0("Assessment of +1: ", plus1_assessment),
+  paste0("Pseudocount sensitivity analysis enabled = ", RUN_PSEUDOCOUNT_SENSITIVITY),
+  "No SD scaling is applied for compound-level differential testing.",
+  "Raw-scale BZ/EZ fold changes are calculated separately from the original values without adding any pseudocount.",
+  "Therefore pseudocount choice affects log-scale statistical modelling but does not redefine the reported raw fold changes.",
+  "Model: StageSeason cell means + Park + BrewingCycle, equivalent to testing Stage x Season while controlling Park and BrewingCycle.",
+
+  "Inference: limma linear models with empirical Bayes moderation; BH FDR correction.",
+  paste0("FDR threshold: ", ALPHA_FDR),
+  paste0("Kruskal-Wallis sensitivity/QC enabled = ", RUN_KW_SENSITIVITY),
+  paste0("KW multiple-testing adjustment = ", KW_ADJUST_METHOD),
+  "KW uses the original values directly and tests Season separately within BZ and EZ.",
+  "KW is a single-factor rank-based sensitivity analysis and does NOT control Park or BrewingCycle.",
+  "Because log2(x+c) is monotonic, log transformation is unnecessary for the KW rank test; pseudocount is therefore not used in KW.",
+  "KW does not determine A-D membership. Categories C/D and all formal season-marker calls are based on the adjusted limma model controlling Park + BrewingCycle.",
+  "KW-only compounds should be interpreted cautiously because apparent Season differences may reflect Park/Cycle background or may not survive multiple-testing adjustment in the adjusted model.",
+  "AdjustedModel-only compounds can occur when controlling Park/Cycle reduces background variation and reveals a consistent Season effect.",
+  "KW/model disagreement is summarized in one discordant-compound table; formal C/D calls remain based on the adjusted-model BH-FDR.",
+  paste0("Detection filter: keep if detection fraction >= ", MIN_DETECTION_FRACTION_ANY_STAGE_SEASON, " in at least one Stage x Season group."),
+  "",
+  "Category A Stable fermentation-associated:",
+  "  overall average EZ-BZ FDR < threshold AND all four seasons have the same EZ-BZ direction",
+  paste0("  AND minimum absolute DeltaLog2 across seasons >= ", MIN_ABS_DELTA_LOG2_EACH_SEASON_FOR_STABLE),
+  paste0("  require all 4 season-specific contrasts individually FDR significant = ", STABLE_REQUIRE_EACH_SEASON_FDR),
+  "",
+  "Category B Season-modulated fermentation-associated:",
+  "  Stage x Season omnibus FDR < threshold.",
+  "",
+  "Category C Initial seasonal marker:",
+  "  BZ four-season omnibus FDR < threshold.",
+  "",
+  "Category D Terminal seasonal marker:",
+  "  EZ four-season omnibus FDR < threshold.",
+  "",
+  "Final FermentationResponseType is mutually exclusive: I=A+B; II=A only; III=B only; IV=neither.",
+  "C and D are retained as separate BZ and EZ seasonal-marker flags in MASTER for traceability.",
+  "Type II: no detected Stage x Season interaction; this does not establish seasonal independence.",
+  "Type III: significant interaction without meeting the complete A criterion; sign reversal is not required.",
+  "BZ and EZ are independent samples within production contexts, not paired batches.",
+  "BH correction is applied across compounds separately for each contrast or omnibus test."
+)
+
+writeLines(
+  method_notes,
+  con = file.path(OUTDIR, "13_README_analysis_definition.txt")
+)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(OUTDIR, "14_sessionInfo.txt")
+)
+
+############################
+```
+
+## 22. Final run summary
+```{r s22-final-run-summary}
+############################
+
+message("\n==============================================")
+message("Flavor compound Season/Stage analysis completed.")
+message("data -> pseudocount QC -> log2(x+", LOG2_PSEUDOCOUNT, ") -> limma")
+
+message("----------------------------------------------")
+message("Number of compounds tested: ", nrow(master))
+message("Type I  Stable direction + season-modulated:",
+        sum(master$FermentationResponseType == "I_Stable_direction_but_season_modulated"))
+message("Type II Consistent direction, no detected seasonal modulation:",
+        sum(master$FermentationResponseType == "II_Stable_season_independent"))
+message("Type III Seasonal modulation without meeting the full A criterion:",
+        sum(master$FermentationResponseType == "III_Season_dependent_directionally_nonstable"))
+message("Type IV Other:",
+        sum(master$FermentationResponseType == "IV_Other"))
+message("BZ initial seasonal markers count:",
+        sum(master$C_InitialSeasonMarker))
+
+message("EZ terminal seasonal markers count:",
+        sum(master$D_TerminalSeasonMarker))
+
+message("----------------------------------------------")
+message("Master results: 05_MASTER_compound_results.csv")
+message("Fermentation-response classification: 06_Fermentation_response_types_I_to_IV.csv")
+message("Classification summary: 09_classification_summary.csv")
+if (RUN_KW_SENSITIVITY) {
+  message("KW sensitivity:10_KW_vs_adjusted_model_summary.csv + 11 discordant table")
+}
+if (RUN_PSEUDOCOUNT_SENSITIVITY) {
+  message("Pseudocount sensitivity:12_pseudocount_sensitivity_summary.csv")
+}
+message("Output directory: ", normalizePath(OUTDIR, winslash = "/", mustWork = FALSE))
+message("==============================================\n")
+
+print(classification_summary)
+```
