@@ -8,7 +8,7 @@ output:
 
 # Overview
 
-This R Markdown document contains the reproducible compound-level workflow used
+This R Markdown document contains the analytical compound-level workflow used
 to evaluate brewing-season and fermentation-stage patterns in flavor data for BZ and EZ samples.
 
 ```{r setup, include=FALSE}
