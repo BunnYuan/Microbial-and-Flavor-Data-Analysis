@@ -9,7 +9,7 @@ output:
 # Overview
 
 This R Markdown document provides the iCAMP workflow used to analyze
-community assembly in **BZ and EZ** across two complete brewing cycles,
+community assembly in BZ and EZ across two complete brewing cycles,
 four brewing seasons, and the Park(Workshop) production backgrounds.
 
 ## Main result levels
